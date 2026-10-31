@@ -36,7 +36,7 @@ GEOMETRY_480P = MappingProxyType({
 })
 
 #: Where the checkpoints live. ``MODEL_ROOT`` is a placeholder: point it at your model directory (the layout below and
-#: in README section 4.5). The bindings record path, size and SHA-256, so profile identities follow these paths.
+#: in docs/installation.md). The bindings record path, size and SHA-256, so profile identities follow these paths.
 MODEL_ROOT = "/models"
 HF_HUB_CACHE = f"{MODEL_ROOT}/huggingface/hub"
 WAN_BASE_DIR = f"{MODEL_ROOT}/Wan2.1-T2V-1.3B"

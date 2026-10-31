@@ -96,7 +96,7 @@ restores histories into the model's cache:
      - `lb_overlap_stream_priority`.
 
 Recommended settings:
-- the Wan compression flags (main README, "Configuration");
+- the Wan compression flags ([acceleration levers](../../docs/configuration.md#acceleration-levers));
 - `finalize_on_fit_device=true`;
 - `lb_overlap_restore=true`, `lb_overlap_release_behind=2`, `lb_native_rope="lean"`.
 

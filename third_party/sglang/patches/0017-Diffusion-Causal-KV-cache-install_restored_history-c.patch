@@ -1,0 +1,185 @@
+From f70c04ee649fbf85578c13485aecb23df67d0a31 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 15:52:40 -0400
+Subject: [PATCH 17/26] [Diffusion] Causal KV cache: install_restored_history
+ checks the layout in O(spans) (PROTOTYPE)
+
+The live-slot checks of install_restored_history built a dict over every live slot and sorted it,
+once per layer and stream. Measured in the ReelCache bridge on A100-40GB (CausVid, 30 layers), this is
+134.7 ms of synchronous restore start at 8 chunks, on the critical path of every restore, plain
+or overlapped.
+
+_check_restored_layout decides the same conditions from the spans:
+- live spans cover exactly [0, local_end), overlaps allowed as before;
+- each installed span's first and last slot map as the live layout does, the last span holding a
+  slot winning as in the per-slot dict.
+Messages are unchanged. A property test compares it with the per-slot check on 3000 random layouts
+(gaps, overlaps, negative or out-of-range slots, empty and stray spans) and on replayed layouts.
+
+CPU, 30 layers, CausVid geometry: 40-50 ms -> 0.4 ms at 4 chunks, 110-380 ms -> 1.2 ms at 8.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_attention_cache.py  | 54 +++++++++----
+ .../test/unit/test_causal_kv_overlap.py       | 75 +++++++++++++++++++
+ 2 files changed, 116 insertions(+), 13 deletions(-)
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+index 1e7ba17221..c846559493 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+@@ -66,6 +66,45 @@ def _position_spans(
+     return tuple(spans)
+ 
+ 
++def _slot_position(spans: Sequence[CausalKVSlotSpan], slot: int) -> int | None:
++    """Global position of ``slot`` under ``spans`` (the last span holding it wins), None when no span holds it."""
++    position = None
++    for span in spans:
++        if span.local_start <= slot < span.local_end:
++            position = span.global_start + slot - span.local_start
++    return position
++
++
++def _check_restored_layout(layout: "CausalKVCacheLayout") -> None:
++    """The slot checks of ``install_restored_history`` in O(spans), not O(slots).
++
++    Live spans must cover exactly ``[0, local_end)``, and every installed span must map its first and last slot as
++    the live layout does. These are the conditions the per-slot mapping checked, computed from the spans.
++    """
++    local_end = layout.local_end_index
++    intervals = sorted(
++        (span.local_start, span.local_end)
++        for span in layout.live
++        if span.local_end > span.local_start
++    )
++    covered = 0
++    for start, end in intervals:
++        if start != covered and not (start < covered):
++            raise ValueError("restored layout must cover exactly the live slots")
++        if start < 0:
++            raise ValueError("restored layout must cover exactly the live slots")
++        covered = max(covered, end)
++    if covered != local_end:
++        raise ValueError("restored layout must cover exactly the live slots")
++    spans = layout.live if layout.attended is None else layout.attended
++    for span in spans:
++        if span.length <= 0 or any(
++            _slot_position(layout.live, slot) != span.global_start + slot - span.local_start
++            for slot in (span.local_start, span.local_end - 1)
++        ):
++            raise ValueError("restored span is not part of the live layout")
++
++
+ @dataclass(frozen=True, slots=True)
+ class CausalKVIndexState:
+     """Cursors, pinned shot sink and geometry of a cache, tagged with its K/V contents.
+@@ -767,20 +806,9 @@ class CausalSelfAttentionKVCache:
+         local_end = layout.local_end_index
+         if not 0 <= local_end <= self.cache_size or layout.global_end_index < local_end:
+             raise ValueError("restored layout cursors are outside the cache")
+-        live = {
+-            slot: span.global_start + slot - span.local_start
+-            for span in layout.live
+-            for slot in range(span.local_start, span.local_end)
+-        }
+-        if sorted(live) != list(range(local_end)):
+-            raise ValueError("restored layout must cover exactly the live slots")
++        # O(spans) (was O(slots) per layer: 40-140 ms per restore of 30 layers at 4-8 CausVid chunks)
++        _check_restored_layout(layout)
+         spans = layout.live if layout.attended is None else layout.attended
+-        for span in spans:
+-            if span.length <= 0 or any(
+-                live.get(slot) != span.global_start + slot - span.local_start
+-                for slot in (span.local_start, span.local_end - 1)
+-            ):
+-                raise ValueError("restored span is not part of the live layout")
+         self.mutation_generation = _next_kv_mutation()
+         self.k[:, :local_end].zero_()
+         self.v[:, :local_end].zero_()
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
+index 777b23a312..faeaf85e52 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
+@@ -171,3 +171,78 @@ def test_the_stage_offers_session_restores_early_with_its_caches():
+         _batch({"session_id": "s", "action": "resume"}), None)  # a failing backend never fails the request
+     _stage(SimpleNamespace(), caches).begin_causal_kv_early_restore(
+         _batch({"session_id": "s", "action": "resume"}), None)  # a backend without the seam: nothing
++
++
++def _per_slot_check(layout):
++    """The per-slot checks ``install_restored_history`` ran before (the reference for the O(spans) version)."""
++    local_end = layout.local_end_index
++    live = {
++        slot: span.global_start + slot - span.local_start
++        for span in layout.live
++        for slot in range(span.local_start, span.local_end)
++    }
++    if sorted(live) != list(range(local_end)):
++        raise ValueError("restored layout must cover exactly the live slots")
++    spans = layout.live if layout.attended is None else layout.attended
++    for span in spans:
++        if span.length <= 0 or any(
++            live.get(slot) != span.global_start + slot - span.local_start
++            for slot in (span.local_start, span.local_end - 1)
++        ):
++            raise ValueError("restored span is not part of the live layout")
++
++
++def _outcome(check, layout):
++    try:
++        check(layout)
++    except ValueError as exc:
++        return str(exc)
++    return None
++
++
++def test_the_span_check_decides_like_the_per_slot_check():
++    """Random layouts (gaps, overlaps, negative or out-of-range slots, empty spans, attended spans inside, across
++    or outside the live ones) and real replayed layouts: the O(spans) check raises exactly when the per-slot one did,
++    with the same message."""
++    import random
++
++    from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
++        CausalKVCacheLayout,
++        CausalKVSlotSpan,
++        _check_restored_layout,
++    )
++
++    rng = random.Random(7)
++    raised = 0
++    for _ in range(3000):
++        local_end = rng.randint(0, 40)
++        live, cursor = [], 0
++        valid = rng.random() < 0.6  # contiguous spans exactly covering [0, local_end), else perturbed ones
++        while cursor < local_end + (0 if valid else rng.choice((0, 0, 3))):
++            length = rng.randint(1, 9) if valid else rng.randint(0, 9)
++            if valid:
++                length = min(length, local_end - cursor)
++            start = cursor if valid else cursor + rng.choice((0, 0, 0, -2, 1, -cursor - 1))
++            live.append(CausalKVSlotSpan(start, start + length, rng.randint(0, 200)))
++            cursor = start + max(length, 1)
++        if live and rng.random() < 0.5:
++            whole = rng.choice(live)
++            attended = [CausalKVSlotSpan(whole.local_start + a, whole.local_start + b, whole.global_start + a)
++                        for a, b in [sorted(rng.sample(range(0, max(whole.length, 1) + 1), 2))]]
++            if rng.random() < 0.3:
++                attended.append(CausalKVSlotSpan(rng.randint(-3, 40), rng.randint(-3, 45), rng.randint(0, 200)))
++        else:
++            attended = None
++        layout = CausalKVCacheLayout(
++            cache_size=64, sink_tokens=0, global_sink_tokens=0, attention_window_size=64,
++            global_end_index=local_end, local_end_index=local_end, pinned_start=-1, pinned_len=0,
++            live=tuple(live), attended=None if attended is None else tuple(attended))
++        expected = _outcome(_per_slot_check, layout)
++        raised += expected is not None
++        assert _outcome(_check_restored_layout, layout) == expected, layout
++    assert 300 < raised < 2700, raised  # both outcomes are well represented
++    for chunks in (1, 2, 4, 6):  # real layouts: sink, window, eviction
++        cache = _cache()
++        layout = cache.replay_layout([(index * CHUNK, CHUNK, index == 0) for index in range(chunks)],
++                                     next_chunk=(chunks * CHUNK, CHUNK))
++        assert _outcome(_per_slot_check, layout) is None and _outcome(_check_restored_layout, layout) is None
+-- 
+2.47.1
+

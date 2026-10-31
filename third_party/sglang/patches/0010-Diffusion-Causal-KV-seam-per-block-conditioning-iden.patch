@@ -1,0 +1,147 @@
+From 100aa7035905bddc2fe3510130aebb928abb3286 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:16:37 -0400
+Subject: [PATCH 10/26] [Diffusion] Causal KV seam: per-block conditioning
+ identity
+
+A prompt switch (LongLive 1.0) or a shot schedule changes the conditioning
+along the timeline. When the whole schedule is part of the request's
+conditioning identity, a session cannot be forked or rewound under a
+different future schedule even though its restored blocks were generated
+under identical conditioning (e.g. a fork from the pre-switch node under
+another prompt, which must run its own recache epoch).
+
+* CausalKVRequest.block_conditioning: optional opaque id per block; the
+  backend compares it over restored blocks only (and restored recache
+  epochs by the block they precede).
+* CausalDMDDenoisingStage._causal_kv_block_conditioning(): stage hook,
+  default None (the request conditioning covers every block). Stages that
+  provide it leave the timeline fields out of the conditioning
+  (_CAUSAL_KV_IDENTITY_EXCLUDE).
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_kv_backend.py       |  4 ++
+ .../pipelines_core/stages/causal_denoising.py | 16 +++++
+ .../test/unit/test_causal_kv_recache_seam.py  | 59 +++++++++++++++++++
+ 3 files changed, 79 insertions(+)
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+index 9038303c5d..c7c6c15fad 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+@@ -178,6 +178,10 @@ class CausalKVRequest:
+     head_dim: int
+     dtype: str
+     model: dict[str, Any]  # pipeline/model identity (class names, path)
++    # Per-block conditioning identity for conditioning that varies along the timeline (prompt switches, shot
++    # prompts): one opaque string per block, compared by the backend over restored blocks only. Stages that
++    # provide it leave the timeline fields out of ``conditioning``. None: ``conditioning`` covers every block.
++    block_conditioning: tuple[str, ...] | None = None
+ 
+ 
+ @dataclass(slots=True)
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+index 3f906ef805..5dfea8a92b 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+@@ -323,6 +323,19 @@ class CausalDMDDenoisingStage(DenoisingStage):
+                     identity[item.name] = {"unserializable": type(value).__name__}
+         return identity
+ 
++    def _causal_kv_block_conditioning(
++        self, batch: Req, server_args: ServerArgs, block_sizes: list[int]
++    ) -> tuple[str, ...] | None:
++        """Per-block conditioning identity (``CausalKVRequest.block_conditioning``).
++
++        Default None: the request's conditioning covers every block. Stages whose
++        conditioning changes along the timeline (prompt switches) return one id per
++        block and exclude those fields from ``_causal_kv_conditioning`` (extend
++        ``_CAUSAL_KV_IDENTITY_EXCLUDE``), so a session can be resumed, forked or
++        rewound under a different future schedule while its restored blocks match.
++        """
++        return None
++
+     def _begin_causal_kv_run(
+         self,
+         batch: Req,
+@@ -388,6 +401,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
+                 "global_sink_tokens": int(kv_cache[0].global_sink_tokens),
+                 "attention_window_tokens": int(kv_cache[0].attention_window_size),
+             },
++            block_conditioning=self._causal_kv_block_conditioning(
++                batch, server_args, block_sizes
++            ),
+         )
+         run = backend.begin_request(request)
+         if run is None:
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_recache_seam.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_recache_seam.py
+index 433070e9ab..57805c4d3b 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_causal_kv_recache_seam.py
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_recache_seam.py
+@@ -123,3 +123,62 @@ def test_attach_numbers_the_attention_modules_of_the_built_dit(monkeypatch):
+     backend = seam.attach_causal_kv_backend(SimpleNamespace(stages=[Stage()]), SimpleNamespace(reelcache_config=args))
+     assert backend == "backend" and attached == ["backend"]
+     assert created == [([0, 1, 2], {"store_root": "/unused", "hevc_inter_prediction": False})]
++
++
++class _Backend:
++    def __init__(self):
++        self.requests = []
++
++    def begin_request(self, request):
++        self.requests.append(request)
++        return None
++
++
++def _session_stage(block_conditioning=None):
++    class Stage(CausalDMDDenoisingStage):
++        def _causal_kv_block_conditioning(self, batch, server_args, block_sizes):
++            if block_conditioning is None:
++                return super()._causal_kv_block_conditioning(batch, server_args, block_sizes)
++            return block_conditioning(block_sizes)
++
++    stage = Stage.__new__(Stage)
++    stage.num_token_per_frame = 4
++    stage.num_transformer_blocks = 2
++    stage.num_frames_per_block = 3
++    stage.transformer = SimpleNamespace(
++        causal_rotary_cos_sin=lambda *a, **k: None,
++        causal_rotate_key=lambda *a: None,
++        config=SimpleNamespace(patch_size=(1, 2, 2)),
++    )
++    stage._causal_kv_backend = _Backend()
++    return stage
++
++
++@pytest.mark.parametrize("schedule", [None, ("A", "A", "B")])
++def test_block_conditioning_reaches_the_backend(schedule):
++    stage = _session_stage(None if schedule is None else (lambda sizes: schedule[: len(sizes)]))
++    cache = SimpleNamespace(
++        k=torch.zeros(1, 24, 2, 4, dtype=torch.bfloat16),
++        cache_size=24,
++        sink_tokens=0,
++        global_sink_tokens=0,
++        attention_window_size=24,
++    )
++    batch = SimpleNamespace(
++        causal_kv_session={"session_id": "s"}, image_latent=None, request_id="r", sampling_params=None
++    )
++    run, resume = stage._begin_causal_kv_run(
++        batch,
++        SimpleNamespace(model_path="toy"),
++        ctx=SimpleNamespace(height=8, width=8),
++        block_sizes=[3, 3, 3],
++        pos_start_base=0,
++        use_cfg=False,
++        kv_cache=[cache, cache],
++        kv_cache_neg=None,
++        latents=torch.zeros(1, 4, 9, 8, 8),
++    )
++    assert (run, resume) == (None, 0)
++    (request,) = stage._causal_kv_backend.requests
++    assert request.block_conditioning == schedule
++    assert seam.CausalKVRequest.__dataclass_fields__["block_conditioning"].default is None
+-- 
+2.47.1
+

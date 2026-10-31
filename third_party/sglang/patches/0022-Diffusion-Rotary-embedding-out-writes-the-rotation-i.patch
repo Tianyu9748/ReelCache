@@ -1,0 +1,400 @@
+From deaffc540e3f47849e42383dceac1aff8ff733bf Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 18:34:09 -0400
+Subject: [PATCH 22/26] [Diffusion] Rotary embedding: out= writes the rotation
+ into a given tensor (restored KV in place)
+
+apply_rotary_embedding (Triton), both torch fallbacks (CPU/MPS, NPU),
+_apply_rotary_emb and causal_wan_rotate_key take an optional out= of x's
+shape and device: x's dtype, or bfloat16/float16 for a float32 x; a
+unit-stride last dimension; no memory shared with x (the kernel is
+autotuned, and autotuning re-runs it on the same pointers). The result is
+written there and returned, e.g. straight into a KV cache slot; invalid
+outputs raise and write nothing. The kernel and its arithmetic are
+unchanged: the store casts to the output's element type, so the bits are
+those of the returned tensor without out= (for a narrower out: of that
+tensor .to(out.dtype), rounded once, as RAVEN's rotate(k).type_as(v)).
+Without out= every call is unchanged. New unit test
+multimodal_gen/test/unit/test_rotary_out.py (8 tests).
+
+Step 5c's F6 proposal ("RoPE into the cache slots"), applied unchanged:
+ReelCache/artifacts/sglang_integration/benchmarks/restore_e2e/results/rope_out/
+proposal_F6/sglang_rope_out.patch (sha256 0b28372c840128e7...; 5c's
+evidence: unit tests 8/8 CPU and 8/8 A100 job 4430990, microbench A100
+4430956). ReelCache side: Step 11's overlay release v7 (freeze F6), whose
+DenseInstall rotates restored keys straight into their slots when
+causal_rotate_key takes out=. Branch reelcache-f6 from reelcache-overlap-proto
+7168db64e3 (the F5.x pin, unchanged).
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../ops/diffusion/common/fallback_npu.py      |  11 +-
+ .../ops/diffusion/common/fallback_torch.py    |  20 ++-
+ .../ops/diffusion/rope/rotary_triton.py       |  54 ++++++-
+ .../runtime/layers/rotary_embedding/utils.py  |  12 +-
+ .../runtime/models/dits/causal_wanvideo.py    |  15 +-
+ .../test/unit/test_rotary_out.py              | 143 ++++++++++++++++++
+ 6 files changed, 241 insertions(+), 14 deletions(-)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_rotary_out.py
+
+diff --git a/python/sglang/kernels/ops/diffusion/common/fallback_npu.py b/python/sglang/kernels/ops/diffusion/common/fallback_npu.py
+index c507a9b600..84033ed966 100644
+--- a/python/sglang/kernels/ops/diffusion/common/fallback_npu.py
++++ b/python/sglang/kernels/ops/diffusion/common/fallback_npu.py
+@@ -18,8 +18,17 @@ def fuse_scale_shift_native(
+ 
+ # TODO: remove this when triton ascend bug is fixed
+ def apply_rotary_embedding_native(
+-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
++    x: torch.Tensor,
++    cos: torch.Tensor,
++    sin: torch.Tensor,
++    interleaved: bool = False,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
++    if out is not None:  # ``apply_rotary_embedding``'s contract: the result is copied there and returned
++        from sglang.kernels.ops.diffusion.rope.rotary_triton import check_rotary_out
++
++        check_rotary_out(x, out)
++        return out.copy_(apply_rotary_embedding_native(x, cos, sin, interleaved))
+     if interleaved and cos.shape[-1] == x.shape[-1]:
+         cos = cos[..., ::2]
+         sin = sin[..., ::2]
+diff --git a/python/sglang/kernels/ops/diffusion/common/fallback_torch.py b/python/sglang/kernels/ops/diffusion/common/fallback_torch.py
+index 87c59ddb7f..3239e019a0 100644
+--- a/python/sglang/kernels/ops/diffusion/common/fallback_torch.py
++++ b/python/sglang/kernels/ops/diffusion/common/fallback_torch.py
+@@ -46,9 +46,19 @@ def fuse_scale_shift_kernel_native(
+ 
+ 
+ def apply_rotary_embedding_native(
+-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
++    x: torch.Tensor,
++    cos: torch.Tensor,
++    sin: torch.Tensor,
++    interleaved: bool = False,
++    out: Optional[Tensor] = None,
+ ) -> torch.Tensor:
+-    """Native fallback for rotary embedding (shared with NPU implementation)."""
++    """Native fallback for rotary embedding (shared with NPU implementation).
++
++    ``out``: the result is copied there and returned (``apply_rotary_embedding``'s contract)."""
++    if out is not None:
++        from sglang.kernels.ops.diffusion.rope.rotary_triton import check_rotary_out
++
++        check_rotary_out(x, out)
+     if interleaved and cos.shape[-1] == x.shape[-1]:
+         cos = cos[..., ::2]
+         sin = sin[..., ::2]
+@@ -58,7 +68,11 @@ def apply_rotary_embedding_native(
+     x2 = x[..., 1::2]
+     o1 = x1 * cos - x2 * sin
+     o2 = x2 * cos + x1 * sin
+-    return torch.stack((o1, o2), dim=-1).flatten(-2)
++    result = torch.stack((o1, o2), dim=-1).flatten(-2)
++    if out is None:
++        return result
++    out.copy_(result)
++    return out
+ 
+ 
+ def norm_infer_native(
+diff --git a/python/sglang/kernels/ops/diffusion/rope/rotary_triton.py b/python/sglang/kernels/ops/diffusion/rope/rotary_triton.py
+index f4fbd3645b..baca5856cb 100644
+--- a/python/sglang/kernels/ops/diffusion/rope/rotary_triton.py
++++ b/python/sglang/kernels/ops/diffusion/rope/rotary_triton.py
+@@ -71,20 +71,59 @@ def _rotary_embedding_kernel(
+ 
+         tl.store(
+             output_row_ptrs + offsets_x1[None, :],
+-            o1_vals.to(x1_vals.dtype),
++            o1_vals.to(output_ptr.dtype.element_ty),
+             mask=mask,
+         )
+         tl.store(
+             output_row_ptrs + offsets_x2[None, :],
+-            o2_vals.to(x2_vals.dtype),
++            o2_vals.to(output_ptr.dtype.element_ty),
+             mask=mask,
+         )
+ 
+ 
++#: ``out`` dtypes a float32 ``x`` may be rotated into: the float32 result rounded once, as ``.to(dtype)`` of the
++#: returned tensor would (round to nearest even).
++NARROWER_OUT_DTYPES = (torch.bfloat16, torch.float16)
++
++
++def check_rotary_out(x: torch.Tensor, out: torch.Tensor) -> None:
++    """``out`` of :func:`apply_rotary_embedding`: ``x``'s shape and device; ``x``'s dtype, or for a float32 ``x`` a
++    narrower float dtype (:data:`NARROWER_OUT_DTYPES`); a unit-stride last dimension; no memory shared with ``x``
++    (the kernel is autotuned, and autotuning re-runs it on the same pointers)."""
++    if not isinstance(out, torch.Tensor):
++        raise TypeError("out must be a tensor")
++    dtype_ok = out.dtype == x.dtype or (
++        x.dtype == torch.float32 and out.dtype in NARROWER_OUT_DTYPES
++    )
++    if out.shape != x.shape or not dtype_ok or out.device != x.device:
++        raise ValueError(
++            f"out must match x: shape {tuple(x.shape)}, dtype {x.dtype} (or narrower for float32), device "
++            f"{x.device} (got {tuple(out.shape)}, {out.dtype}, {out.device})"
++        )
++    if out.numel() and out.stride(-1) != 1:
++        raise ValueError("out must have a unit-stride last dimension")
++    if out.numel() and out.untyped_storage().data_ptr() == x.untyped_storage().data_ptr():
++        raise ValueError("out must not share memory with x")
++
++
+ def apply_rotary_embedding(
+-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
++    x: torch.Tensor,
++    cos: torch.Tensor,
++    sin: torch.Tensor,
++    interleaved: bool = False,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+-    output = torch.empty_like(x)
++    """Rotate ``x`` ([tokens, heads, head_size] or [batch, tokens, heads, head_size]).
++
++    ``out``: write the result there instead of a new tensor and return it (see :func:`check_rotary_out`), e.g.
++    straight into a KV cache slot. The kernel and its arithmetic are the same, so the bits are those of the
++    returned tensor without ``out`` (for a narrower ``out``: of that tensor ``.to(out.dtype)``).
++    """
++    if out is None:
++        output = torch.empty_like(x)
++    else:
++        check_rotary_out(x, out)
++        output = out
+ 
+     if x.dim() > 3:
+         bsz, num_tokens, num_heads, head_size = x.shape
+@@ -95,7 +134,12 @@ def apply_rotary_embedding(
+     assert head_size % 2 == 0, "head_size must be divisible by 2"
+ 
+     x_reshaped = x.view(bsz * num_tokens, num_heads, head_size)
+-    output_reshaped = output.view(bsz * num_tokens, num_heads, head_size)
++    try:
++        output_reshaped = output.view(bsz * num_tokens, num_heads, head_size)
++    except RuntimeError as exc:
++        raise ValueError(
++            "out must be viewable as [batch * tokens, heads, head_size]"
++        ) from exc
+ 
+     if interleaved and cos.shape[-1] == head_size:
+         cos = cos[..., ::2].contiguous()
+diff --git a/python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py b/python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py
+index 0134249d93..a08f3a79d4 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py
++++ b/python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py
+@@ -39,6 +39,7 @@ def _apply_rotary_emb(
+     sin: torch.Tensor,
+     is_neox_style: bool,
+     interleaved: bool = False,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """
+     Args:
+@@ -47,6 +48,8 @@ def _apply_rotary_emb(
+         sin: [num_tokens, head_size // 2]
+         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+             positional embeddings.
++        out: optional tensor of ``x``'s shape and dtype to write the result to
++            (returned); the bits are those of the returned tensor without it.
+     """
+     # cos = cos.unsqueeze(-2).to(x.dtype)
+     # sin = sin.unsqueeze(-2).to(x.dtype)
+@@ -60,9 +63,14 @@ def _apply_rotary_emb(
+             x2 = x[..., 1::2]
+         o1 = (x1.float() * cos - x2.float() * sin).type_as(x)
+         o2 = (x2.float() * cos + x1.float() * sin).type_as(x)
+-        return torch.cat((o1, o2), dim=-1)
++        if out is None:
++            return torch.cat((o1, o2), dim=-1)
++        from sglang.kernels.ops.diffusion.rope.rotary_triton import check_rotary_out
++
++        check_rotary_out(x, out)
++        return torch.cat((o1, o2), dim=-1, out=out)
+     else:
+-        return apply_rotary_embedding(x, cos, sin, interleaved)
++        return apply_rotary_embedding(x, cos, sin, interleaved, out=out)
+ 
+ 
+ def _apply_rotary_emb_complex(
+diff --git a/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py b/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py
+index 0811a09d8b..63837e5016 100644
+--- a/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py
++++ b/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py
+@@ -78,10 +78,19 @@ logger = init_logger(__name__)
+ 
+ 
+ def causal_wan_rotate_key(
+-    key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
++    key: torch.Tensor,
++    cos: torch.Tensor,
++    sin: torch.Tensor,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+-    """The key rotation of ``CausalWanSelfAttention`` (restored history reuses it)."""
+-    return _apply_rotary_emb(key, cos, sin, is_neox_style=False)
++    """The key rotation of ``CausalWanSelfAttention`` (restored history reuses it).
++
++    ``out``: write the rotated key there (``key``'s shape, sharing no memory with it), e.g. straight into a KV cache
++    slot, and return it; same kernel, so the same bits as the returned tensor without ``out``. A float32 key may go
++    into a bfloat16 / float16 ``out``: the bits of ``causal_wan_rotate_key(key, cos, sin).type_as(out)``, as the
++    attention stores its rotated keys.
++    """
++    return _apply_rotary_emb(key, cos, sin, is_neox_style=False, out=out)
+ 
+ 
+ class CausalWanSelfAttention(nn.Module):
+diff --git a/python/sglang/multimodal_gen/test/unit/test_rotary_out.py b/python/sglang/multimodal_gen/test/unit/test_rotary_out.py
+new file mode 100644
+index 0000000000..659fa654a5
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_rotary_out.py
+@@ -0,0 +1,143 @@
++"""``out=`` of the diffusion rotary embedding (Step 5c's F6 proposal: restored KV written in place).
++
++``apply_rotary_embedding`` / ``_apply_rotary_emb`` / ``causal_wan_rotate_key`` take an optional ``out`` of ``x``'s
++shape and dtype, e.g. a slot of a ``[B, T, H, D]`` KV cache, write the rotation there and return it. The kernel and its
++arithmetic are unchanged, so the written bits are those of the returned tensor without ``out``; a float32 ``x`` may
++go into a bfloat16 / float16 ``out`` (rounded once, as ``.to(dtype)``). Nothing outside the slot is touched. Invalid
++outputs raise instead of being resized or written partially.
++
++Without CUDA the torch fallback runs; with CUDA the autotuned Triton kernel, including a first call that autotunes
++into ``out``, and the Wan / LongLive 2.0 head geometries with multi-shot RoPE offsets.
++"""
++
++import pytest
++import torch
++
++from sglang.kernels.ops.diffusion.rope.rotary_triton import (
++    apply_rotary_embedding,
++    check_rotary_out,
++)
++from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
++
++# SGLang binds the rotation per platform (the Triton kernel on CUDA, the torch fallback without it), not per tensor
++# device: run the platform's own implementation.
++DEVICES = ["cuda"] if torch.cuda.is_available() else ["cpu"]
++
++
++def tables(tokens, head_size, *, start_frame=0.0, tokens_per_frame=16, device="cpu"):
++    """Per-token cos / sin (float32) at positions from ``start_frame`` (multi-shot: start + shot * offset)."""
++    positions = (
++        torch.arange(tokens, dtype=torch.float64) // tokens_per_frame + start_frame
++    )
++    inverse = 1.0 / (
++        10000.0 ** (torch.arange(0, head_size, 2, dtype=torch.float64) / head_size)
++    )
++    angles = positions[:, None] * inverse[None, :]
++    return angles.cos().float().to(device), angles.sin().float().to(device)
++
++
++def bits(tensor):
++    return tensor.view(torch.int16 if tensor.element_size() == 2 else torch.int32)
++
++
++def cache_slot(tokens, heads, head_size, dtype, device, *, slot_start=7, capacity=None):
++    capacity = capacity or tokens + 2 * slot_start
++    cache = torch.full(
++        (1, capacity, heads, head_size), float("nan"), dtype=dtype, device=device
++    )
++    return cache, cache[:, slot_start : slot_start + tokens]
++
++
++@pytest.mark.parametrize("device", DEVICES)
++@pytest.mark.parametrize(
++    "tokens,heads,head_size,dtype",
++    [
++        (4680, 12, 128, torch.bfloat16),  # CausVid / RAVEN / LongLive 1.0 chunk
++        (1337, 24, 128, torch.bfloat16),  # LongLive 2.0 heads, odd token count
++        (64, 5, 64, torch.float32),  # an uncached autotune key on CUDA
++    ],
++)
++def test_out_writes_the_returned_bits_into_a_cache_slot(device, tokens, heads, head_size, dtype):
++    generator = torch.Generator().manual_seed(tokens)
++    x = torch.randn(1, tokens, heads, head_size, generator=generator).to(dtype).to(device)
++    for shot in range(3):  # LongLive 2.0: rope_start_frame = start_frame + shot_index * multi_shot_rope_offset
++        cos, sin = tables(tokens, head_size, start_frame=4.0 + shot * 10.0, device=device)
++        expected = apply_rotary_embedding(x, cos, sin)
++        cache, slot = cache_slot(tokens, heads, head_size, dtype, device)
++        before = bits(cache).clone()
++        returned = apply_rotary_embedding(x, cos, sin, out=slot)
++        assert returned.data_ptr() == slot.data_ptr()
++        assert torch.equal(bits(slot), bits(expected))
++        outside = torch.ones(cache.shape[1], dtype=torch.bool)
++        outside[7 : 7 + tokens] = False
++        assert torch.equal(bits(cache)[:, outside.to(device)], before[:, outside.to(device)])
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_the_wan_key_rotation_and_both_rope_styles_take_out(device):
++    x = torch.randn(1, 96, 4, 64, dtype=torch.bfloat16).to(device)
++    cos, sin = tables(96, 64, device=device)
++    for neox in (False, True):
++        expected = _apply_rotary_emb(x, cos, sin, is_neox_style=neox)
++        _, slot = cache_slot(96, 4, 64, torch.bfloat16, device)
++        assert _apply_rotary_emb(x, cos, sin, is_neox_style=neox, out=slot) is slot
++        assert torch.equal(bits(slot), bits(expected))
++    try:
++        from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
++            causal_wan_rotate_key,
++        )
++    except Exception as exc:  # noqa: BLE001 - the model module needs the full runtime
++        pytest.skip(f"causal_wanvideo not importable here: {exc}")
++    expected = causal_wan_rotate_key(x, cos, sin)
++    _, slot = cache_slot(96, 4, 64, torch.bfloat16, device)
++    assert causal_wan_rotate_key(x, cos, sin, out=slot) is slot
++    assert torch.equal(bits(slot), bits(expected))
++
++
++@pytest.mark.parametrize("device", DEVICES)
++@pytest.mark.parametrize("narrow", [torch.bfloat16, torch.float16])
++def test_a_float32_key_rotates_into_a_narrower_cache_rounded_once(device, narrow):
++    """RAVEN rotates float32 keys and stores them bfloat16 (``rotate(k).type_as(v)``): the narrower ``out`` gets
++    exactly those bits; a wider ``out`` than ``x`` is refused (it would skip the rounding to ``x``'s dtype)."""
++    generator = torch.Generator().manual_seed(5)
++    x = (torch.randn(1, 777, 12, 128, generator=generator) * 3).to(device)
++    cos, sin = tables(777, 128, start_frame=21.0, device=device)
++    expected = apply_rotary_embedding(x, cos, sin).to(narrow)
++    cache, slot = cache_slot(777, 12, 128, narrow, device)
++    assert apply_rotary_embedding(x, cos, sin, out=slot) is slot
++    assert torch.equal(bits(slot), bits(expected))
++    assert torch.equal(
++        bits(_apply_rotary_emb(x, cos, sin, is_neox_style=False, out=torch.empty_like(slot))), bits(expected)
++    )
++    with pytest.raises(ValueError):
++        apply_rotary_embedding(x.to(narrow), cos, sin, out=torch.empty_like(x))
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_three_dimensional_inputs_take_out(device):
++    x = torch.randn(200, 3, 32, dtype=torch.bfloat16).to(device)
++    cos, sin = tables(200, 32, device=device)
++    expected = apply_rotary_embedding(x, cos, sin)
++    cache = torch.zeros(300, 3, 32, dtype=torch.bfloat16, device=device)
++    assert torch.equal(bits(apply_rotary_embedding(x, cos, sin, out=cache[50:250])), bits(expected))
++    assert not cache[:50].any() and not cache[250:].any()
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_invalid_outputs_raise_and_write_nothing(device):
++    x = torch.randn(1, 32, 2, 16, dtype=torch.bfloat16).to(device)
++    cos, sin = tables(32, 16, device=device)
++    cases = [
++        torch.zeros(1, 31, 2, 16, dtype=torch.bfloat16, device=device),  # shape
++        torch.zeros(1, 32, 2, 16, dtype=torch.float32, device=device),  # dtype
++        torch.zeros(1, 32, 16, 2, dtype=torch.bfloat16, device=device).transpose(2, 3),  # last stride
++        x,  # the input itself
++        x.view(1, 32, 2, 16)[:, :, :, :],  # a view of the input
++    ]
++    for out in cases:
++        snapshot = out.clone()
++        with pytest.raises(ValueError):
++            apply_rotary_embedding(x, cos, sin, out=out)
++        assert torch.equal(bits(out.contiguous()), bits(snapshot.contiguous()))
++    with pytest.raises(TypeError):
++        check_rotary_out(x, "not a tensor")
+-- 
+2.47.1
+

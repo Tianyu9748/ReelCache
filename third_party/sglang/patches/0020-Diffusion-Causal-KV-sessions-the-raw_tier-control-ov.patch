@@ -1,0 +1,169 @@
+From dda05ef8f26e0efbc5a92fe1badd572d61ea392a Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 17:29:57 -0400
+Subject: [PATCH 20/26] [Diffusion] Causal KV sessions: the raw_tier control
+ over HTTP (F5 pin)
+
+GET/POST /v1/sessions/{session_id}/raw_tier and GET/POST /v1/session_raw_tier
+carry the backend's raw_tier control (action stats | place | demote | drop |
+reset_peaks, placement {chunk or node: gpu_raw | host_raw | compressed}, wait)
+as plain data. Registered with --reelcache-enable only, like every session route.
+Ops and harnesses can now place tiers explicitly (coordinator 17:40, item 3).
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../openai/causal_kv_session_api.py           | 49 ++++++++++++++++-
+ .../unit/test_causal_kv_session_controls.py   | 53 +++++++++++++++++++
+ 2 files changed, 101 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/openai/causal_kv_session_api.py b/python/sglang/multimodal_gen/runtime/entrypoints/openai/causal_kv_session_api.py
+index 7f6da71fcf..18662e2e83 100644
+--- a/python/sglang/multimodal_gen/runtime/entrypoints/openai/causal_kv_session_api.py
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/openai/causal_kv_session_api.py
+@@ -24,13 +24,23 @@ accepts a filesystem path.
+ ``POST   /v1/sessions/{session_id}/fork``                fork (no generation)
+ ``POST   /v1/sessions/{session_id}/rewind``              rewind (no generation)
+ ``POST   /v1/sessions/{session_id}/close``               close (drain | abort)
++``GET    /v1/sessions/{session_id}/raw_tier``            raw tier: session stats
++``POST   /v1/sessions/{session_id}/raw_tier``            raw tier: place | demote | drop
+ ``GET    /v1/session_capabilities``                      capabilities
+ ``GET    /v1/session_requests/{request_id}``             request summary
+ ``POST   /v1/session_gc``                                garbage collection
++``GET    /v1/session_raw_tier``                          raw tier: worker stats
++``POST   /v1/session_raw_tier``                          raw tier: worker actions
+ =======================================================  =====================
++
++The raw-tier endpoints carry the backend's ``raw_tier`` control: ``action``
++(``stats``, ``place``, ``demote``, ``drop``, ``reset_peaks``), ``placement``
++(``{chunk index or node reference: "gpu_raw" | "host_raw" | "compressed"}``,
++``place`` only, which needs a session) and ``wait``. A backend without a raw
++tier answers ``invalid_argument``.
+ """
+ 
+-from typing import Any, Literal, Optional, Union
++from typing import Any, Dict, Literal, Optional, Union
+ 
+ from fastapi import APIRouter, HTTPException, Query
+ from pydantic import BaseModel, ConfigDict
+@@ -66,6 +76,13 @@ class CloseBody(BaseModel):
+     mode: Literal["drain", "abort"] = "drain"
+ 
+ 
++class RawTierBody(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++    action: Literal["stats", "place", "demote", "drop", "reset_peaks"] = "stats"
++    placement: Optional[Dict[str, Literal["gpu_raw", "host_raw", "compressed"]]] = None
++    wait: bool = True
++
++
+ async def _control(op: str, **args: Any) -> dict:
+     """Send one control to the scheduler; typed errors become their HTTP status."""
+     args = {key: value for key, value in args.items() if value is not None}
+@@ -164,3 +181,33 @@ async def rewind_session(session_id: str, body: RewindBody):
+ async def close_session(session_id: str, body: Optional[CloseBody] = None):
+     body = body or CloseBody()
+     return await _control("close", session_id=session_id, mode=body.mode)
++
++
++@router.get("/sessions/{session_id}/raw_tier")
++async def session_raw_tier(session_id: str):
++    return await _control("raw_tier", session_id=session_id)
++
++
++@router.post("/sessions/{session_id}/raw_tier")
++async def session_raw_tier_action(session_id: str, body: Optional[RawTierBody] = None):
++    body = body or RawTierBody()
++    return await _control(
++        "raw_tier",
++        session_id=session_id,
++        action=body.action,
++        placement=body.placement,
++        wait=body.wait,
++    )
++
++
++@router.get("/session_raw_tier")
++async def worker_raw_tier():
++    return await _control("raw_tier")
++
++
++@router.post("/session_raw_tier")
++async def worker_raw_tier_action(body: Optional[RawTierBody] = None):
++    body = body or RawTierBody()
++    return await _control(
++        "raw_tier", action=body.action, placement=body.placement, wait=body.wait
++    )
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+index 43902749ca..128d4da94a 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+@@ -294,6 +294,58 @@ def test_session_endpoints_map_typed_errors_to_http(monkeypatch):
+     assert all(isinstance(req, CausalKVSessionControlReq) for req in sent)
+ 
+ 
++def test_raw_tier_endpoints_forward_the_control_as_plain_data(monkeypatch):
++    sent = []
++
++    async def forward(req, timeout_ms=None):
++        sent.append(req)
++        if req.args.get("action") == "place" and "session_id" not in req.args:
++            error = {
++                "code": "invalid_argument",
++                "status": 400,
++                "message": "place needs session_id",
++            }
++            return OutputBatch(error=error["message"], output={"error": error})
++        return OutputBatch(output={"op": req.op, **req.args})
++
++    monkeypatch.setattr(session_api.async_scheduler_client, "forward", forward)
++    app = FastAPI()
++    app.include_router(session_api.router)
++    client = TestClient(app)
++    assert client.get("/v1/sessions/s1/raw_tier").json() == {
++        "op": "raw_tier",
++        "session_id": "s1",
++    }
++    placement = {"0": "gpu_raw", "1": "host_raw", "manifest:abc": "compressed"}
++    assert client.post(
++        "/v1/sessions/s1/raw_tier", json={"action": "place", "placement": placement}
++    ).json() == {
++        "op": "raw_tier",
++        "session_id": "s1",
++        "action": "place",
++        "placement": placement,
++        "wait": True,
++    }
++    assert client.post("/v1/sessions/s1/raw_tier").json()["action"] == "stats"
++    assert client.get("/v1/session_raw_tier").json() == {"op": "raw_tier"}
++    assert client.post(
++        "/v1/session_raw_tier", json={"action": "demote", "wait": False}
++    ).json() == {"op": "raw_tier", "action": "demote", "wait": False}
++    refused = client.post(
++        "/v1/session_raw_tier", json={"action": "place", "placement": {"0": "gpu_raw"}}
++    )
++    assert refused.status_code == 400
++    assert refused.json()["detail"]["code"] == "invalid_argument"
++    for bad in (
++        {"action": "explode"},
++        {"action": "place", "placement": {"0": "vram"}},
++        {"path": "/x"},
++        {"wait": "maybe"},
++    ):
++        assert client.post("/v1/sessions/s1/raw_tier", json=bad).status_code == 422
++    assert all(isinstance(req, CausalKVSessionControlReq) for req in sent)
++
++
+ def _longlive2_batch(prompts, cuts, shots):
+     params = SimpleNamespace(
+         prompt="ignored", shot_prompts=["A", "B"], multi_shot_sink=True
+@@ -409,6 +461,7 @@ def test_session_router_is_registered_only_with_reelcache():
+         return collect(http_server.create_app(server_args).routes)
+ 
+     assert "/v1/sessions/{session_id}/pause" in paths(True)
++    assert {"/v1/sessions/{session_id}/raw_tier", "/v1/session_raw_tier"} <= paths(True)
+     assert not [path for path in paths(False) if path.startswith("/v1/session")]
+ 
+ 
+-- 
+2.47.1
+

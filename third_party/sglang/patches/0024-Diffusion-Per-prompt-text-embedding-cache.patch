@@ -1,0 +1,1021 @@
+From be4a34dee51c6692e58fcdbd0ab2e04caddd28c6 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 02:02:35 -0400
+Subject: [PATCH 24/26] [Diffusion] Per-prompt text-embedding cache
+
+TextEncodingStage.encode_text gains an optional process-wide host LRU
+(TextEmbeddingCache), off unless SGLANG_WL_EMBED_CACHE_BYTES (bytes) is
+> 0. One entry per prompt; key = (text-encoder identity: model path(s),
+revision, stage / pipeline-config / encoder / tokenizer / pre- and
+postprocessing objects, encoder dtypes, tokenizer and encoder settings,
+conditioning-weights epoch, autocast state; call settings: encoder
+indices, masks, return type, output device and dtype, max_length and the
+other overrides; sha256 of the prompt). An entry holds the prompt's
+encoder output exactly as produced (pinned host copies); a hit copies it
+back to the original device, dtype and strides, so hits are bitwise the
+miss. Eviction is least-recently-used by bytes; hits, misses, stores,
+evictions and bypasses are counted.
+
+A prompt list (LongLive 2.0 block prompts, batch.prompt = block_prompts)
+is served one distinct prompt at a time and the rows are stacked in list
+order: equal to one encoder call per prompt (as LongLive 1.0 and the
+causal-Wan profile stage encode), never dependent on the cache state, and
+a request one shot deeper encodes only its new prompt. The umt5 encoder
+is not batch-invariant, so these rows need not equal one batched call's;
+single-prompt calls are unchanged. Calls the cache cannot serve (stack
+return type, grad or compile, CUDA graph capture, more than one rank,
+outputs that are not one row per prompt) take the plain call (bypass).
+
+With the request's workload timer bound (TextEncodingStage.forward),
+encoder calls and cache misses are timed as text_encode spans and hits
+as text_encode_cached. New unit test test/unit/test_wl_embed_cache.py.
+---
+ .../pipelines_core/stages/text_encoding.py    | 437 ++++++++++++++++
+ .../test/unit/test_wl_embed_cache.py          | 491 ++++++++++++++++++
+ 2 files changed, 928 insertions(+)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_wl_embed_cache.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py
+index 98c62e3037..edd1a37a3b 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py
+@@ -7,14 +7,23 @@ Prompt encoding stages for diffusion pipelines.
+ This module contains implementations of prompt encoding stages for diffusion pipelines.
+ """
+ 
++import functools
++import hashlib
+ import inspect
++import os
++from collections import OrderedDict
++from contextlib import nullcontext
+ 
+ import torch
+ 
+ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+ from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+ from sglang.multimodal_gen.runtime.cache.conditioning import (
++    Uncacheable,
++    _HostTensor,
++    _map_output,
+     cached_encoder_call,
++    conditioning_weights_epoch,
+     prefer_conditioning_cache,
+ )
+ from sglang.multimodal_gen.runtime.distributed import (
+@@ -48,6 +57,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+ from sglang.multimodal_gen.runtime.utils.precision import (
+     resolve_component_precision_override,
+ )
++from sglang.multimodal_gen.runtime.utils.workload_timer import (
++    TEXT_ENCODE,
++    TEXT_ENCODE_CACHED,
++    bind_workload_timer,
++    current_workload_timer,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -116,6 +131,426 @@ def stack_tensors(name: str, tensors: list[torch.Tensor]) -> torch.Tensor:
+     return torch.stack(tensors, dim=0)
+ 
+ 
++# --- optional text-embedding cache (workload-v2 benchmark) -------------------
++
++WL_EMBED_CACHE_ENV = "SGLANG_WL_EMBED_CACHE_BYTES"
++
++
++class TextEmbeddingCache:
++    """Host LRU of ``TextEncodingStage.encode_text`` outputs, one entry per prompt, bounded in bytes.
++
++    Process-wide and off by default: ``SGLANG_WL_EMBED_CACHE_BYTES`` (bytes,
++    default 0) > 0 enables it (:func:`text_embedding_cache`); off,
++    ``encode_text`` runs exactly as before. The key (:func:`text_embedding_key`)
++    is (text-encoder identity: model path(s), revision, stage, pipeline-config,
++    encoder, tokenizer and pre/postprocessing objects, encoder dtypes,
++    tokenizer and encoder settings, conditioning-weights epoch, autocast state;
++    call settings: encoder indices, attention masks, return type, output
++    device and dtype, max_length and the other overrides; sha256 of the
++    prompt). An entry holds that prompt's encoder output exactly as produced (a
++    pinned host copy of each tensor); a hit copies it back to the tensor's
++    original device with its dtype and strides, so a hit is bitwise the miss
++    that stored it.
++
++    A prompt list is served one prompt at a time: each distinct prompt is a hit
++    or a miss (its own encoder call) and the rows are stacked in list order,
++    which equals one encoder call per prompt. A batched call over the list need
++    not be bitwise equal to that (the umt5 encoder is not batch-invariant), so
++    with the cache on, multi-prompt lists (LongLive 2.0 block prompts) get
++    per-prompt embeddings; single-prompt calls are unchanged. Hits and misses
++    are counted here and timed as the request's ``text_encode_cached`` /
++    ``text_encode`` workload-timer spans.
++    """
++
++    def __init__(self, max_bytes: int) -> None:
++        if int(max_bytes) <= 0:
++            raise ValueError("text-embedding cache capacity must be positive")
++        self.max_bytes = int(max_bytes)
++        self.bytes = 0
++        self.hits = self.misses = self.stores = self.evictions = self.bypasses = 0
++        self._entries: OrderedDict = OrderedDict()
++
++    def __len__(self) -> int:
++        return len(self._entries)
++
++    def __contains__(self, key) -> bool:
++        return key in self._entries
++
++    def keys(self) -> list:
++        """Keys from least to most recently used."""
++        return list(self._entries)
++
++    def stats(self) -> dict:
++        return {
++            "hits": self.hits,
++            "misses": self.misses,
++            "stores": self.stores,
++            "evictions": self.evictions,
++            "bypasses": self.bypasses,
++            "entries": len(self._entries),
++            "bytes": self.bytes,
++            "max_bytes": self.max_bytes,
++        }
++
++    def clear(self) -> None:
++        self._entries.clear()
++        self.bytes = 0
++
++    def lookup(self, key):
++        """The entry of ``key`` (a hit; now the most recently used) or None (a miss)."""
++        entry = self._entries.get(key)
++        if entry is None:
++            self.misses += 1
++            return None
++        self.hits += 1
++        self._entries.move_to_end(key)
++        return entry
++
++    def store(self, key, output) -> bool:
++        """Keep a host copy of ``output`` under ``key``, evicting the least recently
++        used entries to fit; False when it is not kept (larger than the capacity,
++        or not a structure of dense tensors and plain values)."""
++        try:
++            size = _encoded_bytes(output)
++            if size > self.max_bytes:
++                raise Uncacheable("larger than the cache")
++            entry = _EmbeddingEntry.snapshot(output, size)
++        except Uncacheable:
++            self.bypasses += 1
++            return False
++        old = self._entries.pop(key, None)
++        if old is not None:
++            self.bytes -= old.size
++        while self._entries and self.bytes + size > self.max_bytes:
++            _, evicted = self._entries.popitem(last=False)
++            self.bytes -= evicted.size
++            self.evictions += 1
++        self._entries[key] = entry
++        self.bytes += size
++        self.stores += 1
++        return True
++
++
++class _EmbeddingEntry:
++    __slots__ = ("output", "size", "ready")
++
++    def __init__(self, output, size: int, ready: tuple) -> None:
++        self.output = output  # the output structure with _HostTensor leaves
++        self.size = size
++        self.ready = ready  # events after the device-to-host copies
++
++    @classmethod
++    def snapshot(cls, output, size: int) -> "_EmbeddingEntry":
++        copies: dict[int, _HostTensor] = {}
++        streams = {}
++
++        def copy(tensor):
++            if id(tensor) not in copies:
++                if (
++                    type(tensor) is not torch.Tensor
++                    or tensor.layout != torch.strided
++                    or tensor.requires_grad
++                ):
++                    raise Uncacheable("only dense inference tensors are cached")
++                host = None
++                if tensor.device.type == "cuda":
++                    stream = torch.cuda.current_stream(tensor.device)
++                    try:
++                        host = torch.empty_like(tensor, device="cpu", pin_memory=True)
++                        host.copy_(tensor.detach(), non_blocking=True)
++                        streams[tensor.device] = stream
++                    except RuntimeError:  # no pinned memory: a synchronous copy
++                        host = None
++                if host is None:
++                    host = tensor.detach().to("cpu", copy=True)
++                copies[id(tensor)] = _HostTensor(host, tensor.device)
++            return copies[id(tensor)]
++
++        stored = _map_output(output, copy)
++        ready = []
++        for stream in streams.values():
++            event = torch.cuda.Event()
++            event.record(stream)
++            ready.append(event)
++        return cls(stored, size, tuple(ready))
++
++    def restore(self):
++        """A copy of the stored output on the original devices (stream-ordered after
++        the snapshot copies; nothing is read on the host)."""
++        for event in self.ready:
++            torch.cuda.current_stream(event.device).wait_event(event)
++        restored: dict[int, torch.Tensor] = {}
++
++        def back(host: _HostTensor):
++            if id(host) not in restored:
++                restored[id(host)] = host.data.to(
++                    host.device, copy=True, non_blocking=host.device.type == "cuda"
++                )
++            return restored[id(host)]
++
++        return _map_output(self.output, back, restore=True)
++
++
++def _encoded_bytes(output) -> int:
++    sizes: dict[int, int] = {}
++
++    def count(tensor):
++        sizes[id(tensor)] = tensor.numel() * tensor.element_size()
++        return tensor
++
++    _map_output(output, count)
++    return sum(sizes.values())
++
++
++_TEXT_EMBEDDING_CACHE: TextEmbeddingCache | None = None
++_TEXT_EMBEDDING_CACHE_SETTING: str | None = None
++
++
++def text_embedding_cache() -> TextEmbeddingCache | None:
++    """The process's text-embedding cache; None unless ``SGLANG_WL_EMBED_CACHE_BYTES`` > 0
++    (a new, empty cache whenever the setting changes)."""
++    global _TEXT_EMBEDDING_CACHE, _TEXT_EMBEDDING_CACHE_SETTING
++    setting = os.environ.get(WL_EMBED_CACHE_ENV, "").strip()
++    if setting != _TEXT_EMBEDDING_CACHE_SETTING:
++        try:
++            capacity = int(setting or "0")
++        except ValueError:
++            raise ValueError(
++                f"{WL_EMBED_CACHE_ENV} must be a number of bytes, got {setting!r}"
++            ) from None
++        if capacity < 0:
++            raise ValueError(f"{WL_EMBED_CACHE_ENV} must be >= 0, got {capacity}")
++        _TEXT_EMBEDDING_CACHE = TextEmbeddingCache(capacity) if capacity else None
++        _TEXT_EMBEDDING_CACHE_SETTING = setting
++    return _TEXT_EMBEDDING_CACHE
++
++
++def _key_material(value):
++    """A repr-stable form of a key component (objects by type and process-local id)."""
++    if value is None or isinstance(value, (bool, int, float, str, bytes)):
++        return value
++    if isinstance(value, (torch.dtype, torch.device)):
++        return str(value)
++    if isinstance(value, dict):
++        items = [(repr(_key_material(k)), _key_material(v)) for k, v in value.items()]
++        return ("dict", tuple(sorted(items, key=lambda item: item[0])))
++    if isinstance(value, (list, tuple)):
++        return (type(value).__name__, tuple(_key_material(v) for v in value))
++    if inspect.isclass(value):
++        return ("class", value.__module__, value.__qualname__)
++    if inspect.ismethod(value):
++        return ("method", _key_material(value.__func__), id(value.__self__))
++    if inspect.isfunction(value):
++        return ("function", value.__module__, value.__qualname__, id(value))
++    return ("object", type(value).__module__, type(value).__qualname__, id(value))
++
++
++def _digest(material) -> str:
++    return hashlib.sha256(repr(_key_material(material)).encode("utf-8")).hexdigest()
++
++
++def _encoder_indices(encoder_index) -> list[int]:
++    if encoder_index is None:
++        return [0]
++    if isinstance(encoder_index, int):
++        return [encoder_index]
++    return list(encoder_index)
++
++
++def _text_embedding_scope(stage, server_args, settings: dict) -> tuple[str, str]:
++    """(text-encoder identity, call settings) digests shared by the prompts of one call."""
++    config = server_args.pipeline_config
++    extra_args = getattr(config, "text_encoder_extra_args", None) or []
++    indices = _encoder_indices(settings.get("encoder_index"))
++    encoders = []
++    for i in indices:
++        encoder = stage.text_encoders[i]
++        parameter = (
++            next(encoder.parameters(), None)
++            if isinstance(encoder, torch.nn.Module)
++            else None
++        )
++        encoder_config = config.text_encoder_configs[i]
++        encoders.append(
++            (
++                i,
++                type(encoder),
++                id(encoder),
++                None if parameter is None else parameter.dtype,
++                type(stage.tokenizers[i]),
++                id(stage.tokenizers[i]),
++                getattr(encoder_config, "tokenizer_kwargs", None),
++                getattr(getattr(encoder_config, "arch_config", None), "text_len", None),
++                extra_args[i] if i < len(extra_args) else None,
++                config.preprocess_text_funcs[i],
++                config.postprocess_text_funcs[i],
++            )
++        )
++    identity = (
++        "sglang.wl_text_embedding.v1",
++        getattr(server_args, "model_path", None),
++        getattr(server_args, "model_paths", None),
++        getattr(server_args, "revision", None),
++        type(stage),
++        type(config),
++        id(config),
++        tuple(encoders),
++        conditioning_weights_epoch(),
++        torch.is_autocast_enabled("cuda"),
++        torch.get_autocast_dtype("cuda"),
++        torch.is_autocast_enabled("cpu"),
++        torch.get_autocast_dtype("cpu"),
++    )
++    device = settings.get("device")
++    call = (
++        tuple(indices),
++        {**settings, "device": device if device is not None else get_local_torch_device()},
++    )
++    return _digest(identity), _digest(call)
++
++
++def text_embedding_key(stage, server_args, prompt: str, settings: dict) -> tuple[str, str, str]:
++    """Cache key of ``prompt`` encoded by ``stage.encode_text(prompt, server_args, **settings)``:
++    (text-encoder identity, call settings, prompt sha256), hex digests."""
++    identity, call = _text_embedding_scope(stage, server_args, settings)
++    return identity, call, hashlib.sha256(prompt.encode("utf-8")).hexdigest()
++
++
++def _cacheable_text_call(text, settings: dict) -> bool:
++    if not (
++        isinstance(text, str)
++        or (
++            isinstance(text, list)
++            and text
++            and all(isinstance(item, str) for item in text)
++        )
++    ):
++        return False
++    if settings.get("return_type", "list") not in ("list", "dict"):
++        return False
++    if torch.is_grad_enabled() or torch.compiler.is_compiling():
++        return False
++    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        return False
++    # one cache per rank: ranks whose hits differed would skip encoder collectives
++    return not (
++        torch.distributed.is_available()
++        and torch.distributed.is_initialized()
++        and torch.distributed.get_world_size() > 1
++    )
++
++
++def _is_row_value_list(value) -> bool:
++    return bool(value) and all(
++        isinstance(item, (int, float)) and not isinstance(item, bool) for item in value
++    )
++
++
++def _one_row(value) -> bool:
++    """Whether an encoder output describes exactly one prompt row (stackable)."""
++    if value is None:
++        return True
++    if isinstance(value, torch.Tensor):
++        return value.dim() >= 1 and value.shape[0] == 1
++    if isinstance(value, dict):
++        return all(_one_row(item) for item in value.values())
++    if isinstance(value, (list, tuple)):
++        if _is_row_value_list(value):
++            return len(value) == 1
++        return all(_one_row(item) for item in value)
++    return False
++
++
++def _stack_rows(parts: list):
++    """The per-prompt outputs stacked into the structure of one call over all rows."""
++    first = parts[0]
++    if first is None:
++        if any(part is not None for part in parts):
++            raise ValueError("per-prompt text encodings differ in structure")
++        return None
++    if isinstance(first, torch.Tensor):
++        return torch.cat(parts, dim=0)
++    if isinstance(first, dict):
++        return {key: _stack_rows([part[key] for part in parts]) for key in first}
++    if isinstance(first, (list, tuple)):
++        if _is_row_value_list(first):
++            return [item for part in parts for item in part]
++        if any(len(part) != len(first) for part in parts):
++            raise ValueError("per-prompt text encodings differ in structure")
++        items = [_stack_rows([part[i] for part in parts]) for i in range(len(first))]
++        return items if isinstance(first, list) else tuple(items)
++    raise TypeError(f"cannot stack text-encoder output of type {type(first).__name__}")
++
++
++def _timer_span(timer, name: str):
++    return nullcontext() if timer is None else timer.span(name)
++
++
++def _text_embedding_cached(encode_text):
++    """``TextEncodingStage.encode_text`` with the optional text-embedding cache and the
++    workload timer's ``text_encode`` / ``text_encode_cached`` spans; without both it is
++    the plain call."""
++    signature = inspect.signature(encode_text)
++
++    @functools.wraps(encode_text)
++    def wrapper(self, text, server_args, *args, **kwargs):
++        cache = text_embedding_cache()
++        timer = current_workload_timer()
++        if cache is None:
++            if timer is None:
++                return encode_text(self, text, server_args, *args, **kwargs)
++            with timer.span(TEXT_ENCODE):
++                return encode_text(self, text, server_args, *args, **kwargs)
++        bound = signature.bind(self, text, server_args, *args, **kwargs)
++        bound.apply_defaults()
++        settings = {
++            name: value
++            for name, value in bound.arguments.items()
++            if name not in ("self", "text", "server_args")
++        }
++        if not _cacheable_text_call(text, settings):
++            cache.bypasses += 1
++            with _timer_span(timer, TEXT_ENCODE):
++                return encode_text(self, text, server_args, *args, **kwargs)
++        prompts = [text] if isinstance(text, str) else list(text)
++        identity, call = _text_embedding_scope(self, server_args, settings)
++        outputs = {}
++        missed = False
++        for prompt in dict.fromkeys(prompts):
++            key = (identity, call, hashlib.sha256(prompt.encode("utf-8")).hexdigest())
++            entry = cache.lookup(key)
++            if entry is not None:
++                with _timer_span(timer, TEXT_ENCODE_CACHED):
++                    outputs[prompt] = entry.restore()
++                continue
++            missed = True
++            with _timer_span(timer, TEXT_ENCODE):
++                output = encode_text(self, [prompt], server_args, **settings)
++                cache.store(key, output)
++            outputs[prompt] = output
++        if not missed:
++            # as on a conditioning-cache hit: weights retained by an earlier use are released
++            for i in _encoder_indices(settings.get("encoder_index")):
++                self.finish_unused_declared_component(
++                    component_name="text_encoder" if i == 0 else f"text_encoder_{i + 1}",
++                    module=self.text_encoders[i],
++                )
++        if len(prompts) == 1:
++            return outputs[prompts[0]]
++        parts = [outputs[prompt] for prompt in prompts]
++        try:
++            if all(_one_row(part) for part in parts):
++                return _stack_rows(parts)
++        except (TypeError, ValueError, RuntimeError, KeyError, IndexError):
++            pass
++        # not one stackable row per prompt (e.g. 2-D embeddings): the plain batched call
++        cache.bypasses += 1
++        with _timer_span(timer, TEXT_ENCODE):
++            return encode_text(self, text, server_args, *args, **kwargs)
++
++    return wrapper
++
++
+ class TextEncodingStage(ConditionEncodingStage):
+     """
+     Stage for encoding text prompts into embeddings for diffusion models.
+@@ -308,6 +743,7 @@ class TextEncodingStage(ConditionEncodingStage):
+             )
+ 
+     @torch.no_grad()
++    @bind_workload_timer
+     def forward(
+         self,
+         batch: Req,
+@@ -475,6 +911,7 @@ class TextEncodingStage(ConditionEncodingStage):
+         )
+ 
+     @torch.no_grad()
++    @_text_embedding_cached
+     def encode_text(
+         self,
+         text: str | list[str],
+diff --git a/python/sglang/multimodal_gen/test/unit/test_wl_embed_cache.py b/python/sglang/multimodal_gen/test/unit/test_wl_embed_cache.py
+new file mode 100644
+index 0000000000..8657095c86
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_wl_embed_cache.py
+@@ -0,0 +1,491 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Text-embedding cache (workload-v2): per-prompt host LRU of ``TextEncodingStage.encode_text`` outputs.
++
++Off unless ``SGLANG_WL_EMBED_CACHE_BYTES`` > 0 (then ``encode_text`` is the plain call). A hit returns the stored
++output bitwise (dtype and device kept); a prompt list is served per prompt, so the result never depends on the
++cache state (hits == misses) -- the encoder here is batch-variant on purpose, as umt5 is. Eviction is LRU by bytes;
++the key changes with every encoder and call setting; hits and misses are counted and timed as ``text_encode`` /
++``text_encode_cached`` spans of the request's workload timer.
++"""
++
++import hashlib
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++import torch
++from transformers import BatchEncoding
++
++from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
++from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
++from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
++from sglang.multimodal_gen.runtime.cache.conditioning import (
++    ConditioningCache,
++    invalidate_conditioning_caches,
++)
++from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
++from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
++from sglang.multimodal_gen.runtime.pipelines_core.stages import text_encoding as te
++from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
++    CAUSAL_BLOCK_PROMPTS_KEY,
++)
++from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.longlive2 import (
++    LongLive2TextEncodingStage,
++)
++from sglang.multimodal_gen.runtime.utils import workload_timer as wt
++
++_GLOBAL_ARGS_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
++DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
++TOKENS = 4
++
++
++class BatchVariantEncoder(TextEncoder):
++    """Toy encoder whose rows depend on the batch size (umt5 is not batch-invariant either)."""
++
++    uses_sglang_forward_context = False
++
++    def __init__(self, dtype=torch.float32):
++        torch.nn.Module.__init__(self)
++        self.weight = torch.nn.Parameter(torch.ones((), dtype=dtype))
++        self.calls = []  # batch size of every forward
++
++    def forward(self, input_ids, **kwargs):
++        self.calls.append(int(input_ids.shape[0]))
++        base = input_ids[..., None].to(self.weight.dtype) * self.weight
++        jitter = 1e-3 * input_ids.shape[0]
++        states = tuple(base.repeat(1, 1, 3) / 7 + layer + jitter for layer in range(6))
++        return BaseEncoderOutput(
++            last_hidden_state=states[-1],
++            hidden_states=states,
++            pooler_output=states[-1][:, 0].clone(),
++        )
++
++
++def _postprocess(output, text_inputs, return_attention_mask=False):
++    return output.hidden_states[3]
++
++
++def _postprocess_other(output, text_inputs, return_attention_mask=False):
++    return output.hidden_states[4]
++
++
++def _tokenize(texts, _tokenizer, kwargs):
++    length = int(kwargs.get("max_length") or TOKENS)
++    rows = []
++    for text in texts:
++        digest = hashlib.sha256(text.encode()).digest()
++        rows.append([len(text)] + [digest[i] for i in range(length - 1)])
++    return BatchEncoding(
++        {
++            "input_ids": torch.tensor(rows),
++            "attention_mask": torch.ones((len(texts), length), dtype=torch.long),
++        }
++    )
++
++
++def make_config(encoders=1, *, tokenizer_kwargs=None, postprocess=_postprocess):
++    return SimpleNamespace(
++        text_encoder_configs=[
++            SimpleNamespace(tokenizer_kwargs=dict(tokenizer_kwargs or {})) for _ in range(encoders)
++        ],
++        preprocess_text_funcs=[None] * encoders,
++        postprocess_text_funcs=[postprocess] * encoders,
++        text_encoder_extra_args=[],
++        is_flux_v1=lambda: False,
++        tokenize_prompt=_tokenize,
++        get_text_encoder_attention_mask=lambda inputs, _: inputs["attention_mask"],
++        get_text_encoder_pooler_output=lambda outputs, _: outputs.pooler_output,
++        build_text_conditioning_mask=lambda inputs, mask, embeds, _: mask.bool(),
++        seq_lens_from_text_conditioning_mask=lambda mask: mask.sum(-1).tolist(),
++        vae_config=SimpleNamespace(use_temporal_scaling_frames=False),
++        dit_config=SimpleNamespace(arch_config=SimpleNamespace(num_frames_per_block=1)),
++    )
++
++
++def make_args(config=None, **kwargs):
++    defaults = {
++        "pipeline_config": config or make_config(),
++        "model_path": "/models/longlive2/snapshots/rev-a",
++        "model_paths": {"text_encoder": "/models/longlive2/snapshots/rev-a/text_encoder"},
++    }
++    defaults.update(kwargs)
++    return SimpleNamespace(**defaults)
++
++
++def make_stage(encoders, stage_type=te.TextEncodingStage):
++    with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock()):
++        stage = stage_type(text_encoders=list(encoders), tokenizers=[object() for _ in encoders])
++    stage._begin_text_encoder_use = MagicMock()
++    stage._text_encode_dp_group = MagicMock(return_value=None)
++    return stage
++
++
++@pytest.fixture
++def cache_bytes(monkeypatch):
++    """Set ``SGLANG_WL_EMBED_CACHE_BYTES`` and start from a fresh process cache."""
++
++    def set_bytes(value):
++        monkeypatch.setenv(te.WL_EMBED_CACHE_ENV, str(value))
++        monkeypatch.setattr(te, "_TEXT_EMBEDDING_CACHE", None)
++        monkeypatch.setattr(te, "_TEXT_EMBEDDING_CACHE_SETTING", None)
++        return te.text_embedding_cache()
++
++    monkeypatch.delenv(te.WL_EMBED_CACHE_ENV, raising=False)
++    monkeypatch.setattr(te, "_TEXT_EMBEDDING_CACHE", None)
++    monkeypatch.setattr(te, "_TEXT_EMBEDDING_CACHE_SETTING", None)
++    return set_bytes
++
++
++def tensors(value):
++    """The tensors of an encode_text output, in structure order."""
++    if isinstance(value, torch.Tensor):
++        return [value]
++    if isinstance(value, dict):
++        return [t for item in value.values() for t in tensors(item)]
++    if isinstance(value, (list, tuple)):
++        return [t for item in value for t in tensors(item)]
++    return []
++
++
++def bits(tensor):
++    tensor = tensor.detach()
++    if tensor.dtype == torch.bool:
++        return tensor.to(torch.uint8)
++    return tensor.view(torch.int16) if tensor.element_size() == 2 else tensor.view(torch.int32 if tensor.element_size() == 4 else torch.int64)
++
++
++def assert_bitwise(left, right):
++    """Same structure, same plain values, tensors equal bit for bit with the same dtype, device and shape."""
++    assert type(left) is type(right)
++    if isinstance(left, torch.Tensor):
++        assert (left.dtype, left.device, left.shape) == (right.dtype, right.device, right.shape)
++        assert torch.equal(bits(left), bits(right))
++    elif isinstance(left, dict):
++        assert list(left) == list(right)
++        for key in left:
++            assert_bitwise(left[key], right[key])
++    elif isinstance(left, (list, tuple)):
++        assert len(left) == len(right)
++        for a, b in zip(left, right):
++            assert_bitwise(a, b)
++    else:
++        assert left == right
++
++
++def snapshot(value):
++    if isinstance(value, torch.Tensor):
++        return value.clone()
++    if isinstance(value, dict):
++        return {k: snapshot(v) for k, v in value.items()}
++    if isinstance(value, (list, tuple)):
++        return type(value)(snapshot(v) for v in value)
++    return value
++
++
++def encode(stage, text, args, device, **kwargs):
++    kwargs.setdefault("return_attention_mask", True)
++    return stage.encode_text(text, args, device=device, **kwargs)
++
++
++# --- switch -------------------------------------------------------------------------------------------------------
++
++
++def test_off_by_default_and_env_parsing(cache_bytes, monkeypatch):
++    assert te.text_embedding_cache() is None
++    assert cache_bytes(0) is None
++    cache = cache_bytes(1 << 20)
++    assert isinstance(cache, te.TextEmbeddingCache) and cache.max_bytes == 1 << 20
++    assert te.text_embedding_cache() is cache  # same setting: same cache
++    monkeypatch.setenv(te.WL_EMBED_CACHE_ENV, str(2 << 20))
++    assert te.text_embedding_cache() is not cache  # a new setting: a new, empty cache
++    for bad in ("lots", "-1", "1.5e9"):
++        monkeypatch.setenv(te.WL_EMBED_CACHE_ENV, bad)
++        with pytest.raises(ValueError):
++            te.text_embedding_cache()
++
++
++@pytest.mark.parametrize("device", DEVICES)
++@torch.no_grad()
++def test_cache_off_is_the_plain_call(cache_bytes, device):
++    encoder = BatchVariantEncoder().to(device)
++    stage, args = make_stage([encoder]), make_args()
++    first = encode(stage, ["a", "b"], args, device)
++    second = encode(stage, ["a", "b"], args, device)
++    assert encoder.calls == [2, 2]  # one batched call each time, nothing cached
++    assert_bitwise(first, second)
++
++
++# --- bitwise equality ----------------------------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("device", DEVICES)
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++@torch.no_grad()
++def test_single_prompt_hit_is_bitwise_the_uncached_output(cache_bytes, device, dtype):
++    encoder = BatchVariantEncoder(dtype).to(device)
++    stage, args = make_stage([encoder]), make_args()
++    uncached = encode(stage, "a red apple", args, device)
++    cache = cache_bytes(1 << 20)
++    miss = encode(stage, "a red apple", args, device)
++    expected = snapshot(miss)
++    for tensor in tensors(miss):  # the caller owns what it got: mutating it must not reach the cache
++        tensor.zero_()
++    hit = encode(stage, "a red apple", args, device)
++    hit_again = encode(stage, ["a red apple"], args, device)
++    assert encoder.calls == [1, 1]
++    assert_bitwise(hit, expected)
++    assert_bitwise(hit_again, expected)
++    assert_bitwise(hit, uncached)  # single prompts: cache on == cache off, bitwise
++    assert all(t.device.type == device for t in tensors(hit))
++    assert {t.dtype for t in tensors(hit)} == {t.dtype for t in tensors(uncached)}
++    assert cache.stats()["hits"] == 2 and cache.stats()["misses"] == 1 and cache.stats()["stores"] == 1
++    # the dict return type is cached as well
++    as_dict = encode(stage, "a red apple", args, device, return_type="dict", return_attention_mask=False)
++    assert_bitwise(encode(stage, "a red apple", args, device, return_type="dict", return_attention_mask=False), as_dict)
++
++
++@pytest.mark.parametrize("device", DEVICES)
++@torch.no_grad()
++def test_prompt_lists_are_served_per_prompt_and_never_depend_on_the_cache_state(cache_bytes, device):
++    encoder = BatchVariantEncoder().to(device)
++    stage, args = make_stage([encoder]), make_args()
++    history = ["shot A", "shot A", "cut: shot B", "cut: shot C"]
++    batched = encode(stage, history, args, device)  # cache off: one batched call
++    per_prompt = [encode(stage, [p], args, device) for p in history]  # cache off: one call per prompt
++    reference = te._stack_rows(per_prompt)
++    cache = cache_bytes(1 << 20)
++    encoder.calls.clear()
++    cold = encode(stage, history, args, device)
++    assert encoder.calls == [1, 1, 1]  # each distinct prompt alone, once
++    assert_bitwise(cold, reference)
++    # the batch-variant encoder: a batched call differs from per-prompt calls (documented semantics)
++    assert not torch.equal(cold[0][0], batched[0][0])
++    warm = encode(stage, history, args, device)
++    assert encoder.calls == [1, 1, 1]
++    assert_bitwise(warm, cold)
++    # a request one shot deeper: the historical shots hit, only the new one is encoded
++    deeper = history + ["cut: shot D"]
++    grown = encode(stage, deeper, args, device)
++    assert encoder.calls == [1, 1, 1, 1]
++    cache.clear()
++    encoder.calls.clear()
++    assert_bitwise(encode(stage, deeper, args, device), grown)  # cold == warm, bitwise
++    assert encoder.calls == [1, 1, 1, 1]
++    assert cache.stats()["hits"] == 3 + 3 and cache.stats()["misses"] == 3 + 1 + 4
++
++
++@torch.no_grad()
++def test_longlive2_block_prompts_reuse_the_historical_shots(cache_bytes):
++    encoder = BatchVariantEncoder()
++    stage, args = make_stage([encoder], LongLive2TextEncodingStage), make_args()
++
++    def request(shots):
++        return Req(
++            sampling_params=LongLive2SamplingParams(
++                prompt=shots[0], shot_prompts=shots, shot_durations=[1] * len(shots), num_frames=len(shots)
++            ),
++            do_classifier_free_guidance=False,
++        )
++
++    shots = ["a cat on a sofa", "the cat jumps", "the cat sleeps", "the cat wakes"]
++    plain = stage.forward(request(shots), args)
++    cache = cache_bytes(64 << 20)
++    encoder.calls.clear()
++    first = stage.forward(request(shots), args)
++    assert encoder.calls == [1, 1, 1, 1]
++    second = stage.forward(request(shots + ["the cat leaves"]), args)
++    assert encoder.calls == [1, 1, 1, 1, 1]  # only the new shot is encoded
++    assert cache.stats()["hits"] == 4 and cache.stats()["misses"] == 5
++    blocks = second.extra[CAUSAL_BLOCK_PROMPTS_KEY]
++    assert len(blocks) == 5 and blocks[1].startswith("The scene transitions. ")
++    assert second.prompt_embeds[0].shape[0] == 5
++    assert torch.equal(second.prompt_embeds[0][:4], first.prompt_embeds[0])
++    assert plain.prompt_embeds[0].shape == first.prompt_embeds[0].shape
++
++
++# --- LRU by bytes and keys -----------------------------------------------------------------------------------------
++
++
++def test_lru_eviction_by_bytes():
++    def output(value):
++        return ([torch.full((1, 4, 8), float(value))], [torch.ones((1, 4), dtype=torch.long)], [[4]])
++
++    size = te._encoded_bytes(output(0))
++    assert size == 4 * 8 * 4 + 4 * 8
++    cache = te.TextEmbeddingCache(int(2.5 * size))
++    assert cache.store("a", output(1)) and cache.store("b", output(2))
++    assert cache.lookup("a") is not None  # a is now the most recently used
++    assert cache.store("c", output(3))
++    assert cache.keys() == ["a", "c"] and cache.evictions == 1 and cache.bytes == 2 * size
++    assert cache.lookup("b") is None
++    assert_bitwise(cache.lookup("a").restore(), output(1))
++    assert not cache.store("huge", ([torch.zeros(1, 64, 64)],))  # larger than the cache: never kept
++    assert cache.keys() == ["c", "a"] and cache.bytes <= cache.max_bytes
++    assert cache.store("a", output(5)) and cache.bytes == 2 * size  # replacing keeps the byte count exact
++    assert_bitwise(cache.lookup("a").restore(), output(5))
++    stats = cache.stats()
++    assert (stats["hits"], stats["misses"], stats["stores"], stats["evictions"], stats["bypasses"]) == (3, 1, 4, 1, 1)
++    cache.clear()
++    assert len(cache) == 0 and cache.bytes == 0
++
++
++@torch.no_grad()
++def test_store_shares_aliased_tensors_and_rejects_live_objects():
++    mask = torch.ones(1, 4, dtype=torch.long)
++    cache = te.TextEmbeddingCache(1 << 20)
++    assert cache.store("k", ([torch.zeros(1, 4, 2)], [mask], [mask]))
++    restored = cache.lookup("k").restore()
++    assert restored[1][0] is restored[2][0] and cache.bytes == 4 * 2 * 4 + 4 * 8
++    assert not cache.store("live", ([object()],))
++    assert "live" not in cache and cache.bypasses == 1
++
++
++@torch.no_grad()
++def test_key_changes_with_every_encoder_and_call_setting():
++    encoder = BatchVariantEncoder()
++    stage, args = make_stage([encoder]), make_args()
++    config = args.pipeline_config
++    base_settings = dict(
++        encoder_index=None,
++        return_attention_mask=True,
++        return_type="list",
++        device="cpu",
++        dtype=None,
++        max_length=None,
++        truncation=None,
++        padding=None,
++        return_overflowing_tokens=None,
++        return_length=None,
++    )
++
++    def key(prompt="a", stage=stage, **changes):
++        return te.text_embedding_key(stage, args, prompt, {**base_settings, **changes})
++
++    base = key()
++    assert base == key() and len(base) == 3 and all(isinstance(part, str) for part in base)
++    assert base[2] == hashlib.sha256(b"a").hexdigest()
++    assert key("b")[:2] == base[:2] and key("b")[2] != base[2]  # one scope for every prompt of a call
++
++    def changed(target, name, value):
++        """The key with one attribute / item of the live objects changed, then restored."""
++        getter, setter = (
++            (lambda: target[name], lambda v: target.__setitem__(name, v))
++            if isinstance(target, (dict, list))
++            else (lambda: getattr(target, name, None), lambda v: setattr(target, name, v))
++        )
++        before = getter()
++        setter(value)
++        try:
++            return key()
++        finally:
++            setter(before)
++
++    variants = {
++        # call settings
++        "max_length": key(max_length=8),
++        "dtype": key(dtype=torch.bfloat16),
++        "device": key(device="meta"),
++        "masks": key(return_attention_mask=False),
++        "return_type": key(return_type="dict"),
++        "encoder_index": key(encoder_index=[0]),
++        "padding": key(padding="max_length"),
++        # text-encoder identity (each changed alone on the same objects)
++        "tokenizer_kwargs": changed(config.text_encoder_configs[0], "tokenizer_kwargs", {"max_length": 512}),
++        "text_len": changed(config.text_encoder_configs[0], "arch_config", SimpleNamespace(text_len=512)),
++        "preprocess": changed(config.preprocess_text_funcs, 0, str.lower),
++        "postprocess": changed(config.postprocess_text_funcs, 0, _postprocess_other),
++        "extra_args": changed(config, "text_encoder_extra_args", [{"add_special_tokens": False}]),
++        "model_path": changed(args, "model_path", "/models/longlive2/snapshots/rev-b"),
++        "text_encoder_path": changed(args.model_paths, "text_encoder", "/models/other/text_encoder"),
++        "revision": changed(args, "revision", "rev-b"),
++        "encoder_object": key(stage=make_stage([BatchVariantEncoder()])),
++        "stage_class": key(stage=make_stage([encoder], LongLive2TextEncodingStage)),
++    }
++    assert key() == base  # every change was undone
++    with torch.no_grad():
++        encoder.weight.data = encoder.weight.data.to(torch.bfloat16)
++        variants["encoder_dtype"] = key()
++        encoder.weight.data = encoder.weight.data.to(torch.float32)
++    for name, variant in variants.items():
++        assert variant[:2] != base[:2], name
++        assert variant[2] == base[2], name
++    two = make_stage([encoder, BatchVariantEncoder()])
++    args.pipeline_config = make_config(2)
++    assert te.text_embedding_key(two, args, "a", {**base_settings, "encoder_index": [0]}) != te.text_embedding_key(
++        two, args, "a", {**base_settings, "encoder_index": [1]}
++    )
++    args.pipeline_config = config
++    invalidate_conditioning_caches()  # weight updates bump the epoch: old entries are never hit again
++    assert key()[0] != base[0]
++
++
++# --- accounting and timer spans ------------------------------------------------------------------------------------
++
++
++@torch.no_grad()
++def test_hits_and_misses_are_counted_and_timed(cache_bytes):
++    encoder = BatchVariantEncoder()
++    stage, args = make_stage([encoder]), make_args()
++
++    def request(timer):
++        req = Req(
++            sampling_params=SamplingParams(prompt="hello", num_inference_steps=4),
++            do_classifier_free_guidance=False,
++        )
++        if timer is not None:
++            req.extra["wl_timer"] = timer
++        return req
++
++    off = wt.WorkloadTimer(cuda=False)
++    stage.forward(request(off), args)  # cache off: one span around the encoder call
++    assert [s["name"] for s in off.resolve()["spans"]] == ["text_encode"]
++    cache = cache_bytes(1 << 20)
++    timers = [wt.WorkloadTimer(cuda=False) for _ in range(3)]
++    outputs = [stage.forward(request(timer), args) for timer in timers]
++    stage.forward(request(None), args)  # without a timer: counted, not timed
++    assert [[s["name"] for s in t.resolve()["spans"]] for t in timers] == [
++        ["text_encode"],
++        ["text_encode_cached"],
++        ["text_encode_cached"],
++    ]
++    assert cache.stats()["misses"] == 1 and cache.stats()["hits"] == 3 and encoder.calls == [1, 1]
++    for out in outputs[1:]:
++        assert_bitwise(out.prompt_embeds, outputs[0].prompt_embeds)
++    assert wt.current_workload_timer() is None
++
++
++@torch.no_grad()
++def test_per_prompt_subclass_and_conditioning_cache_compose(cache_bytes):
++    """A stage that encodes each prompt in its own call (ReelCache's causal-Wan stage does) hits per prompt, also
++    inside SGLang's own conditioning-cache scope."""
++
++    class PerPromptStage(te.TextEncodingStage):
++        def encode_text(self, text, server_args, *args, **kwargs):
++            if isinstance(text, str) or len(text) <= 1:
++                return super().encode_text(text, server_args, *args, **kwargs)
++            return te._stack_rows([super(PerPromptStage, self).encode_text([t], server_args, *args, **kwargs) for t in text])
++
++    encoder = BatchVariantEncoder()
++    stage, args = make_stage([encoder], PerPromptStage), make_args()
++    plain = encode(stage, ["first", "switch"], args, "cpu")
++    cache = cache_bytes(1 << 20)
++    encoder.calls.clear()
++    with ConditioningCache(1 << 20).scope():
++        cached = encode(stage, ["first", "switch"], args, "cpu")
++        again = encode(stage, ["first", "switch", "first"], args, "cpu")
++    assert_bitwise(cached, plain)
++    assert_bitwise(again[0][0][:2], plain[0][0])
++    assert encoder.calls == [1, 1] and cache.stats()["hits"] == 3
++
++
++@torch.no_grad()
++def test_uncacheable_calls_bypass(cache_bytes):
++    encoder = BatchVariantEncoder()
++    stage, args = make_stage([encoder]), make_args()
++    plain = encode(stage, ["a", "b"], args, "cpu", return_type="stack", return_attention_mask=False)
++    cache = cache_bytes(1 << 20)
++    encoder.calls.clear()
++    stacked = encode(stage, ["a", "b"], args, "cpu", return_type="stack", return_attention_mask=False)
++    assert encoder.calls == [2]  # the plain batched call
++    assert_bitwise(stacked, plain)
++    assert cache.bypasses == 1 and len(cache) == 0 and cache.hits == cache.misses == 0
+-- 
+2.47.1
+

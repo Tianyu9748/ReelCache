@@ -1,0 +1,796 @@
+From 62aa4d17730c6ae92c806f038394b1ba91275df7 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 02:02:26 -0400
+Subject: [PATCH 23/26] [Diffusion] Workload timer: opt-in request marks
+
+runtime/utils/workload_timer.py (new): WorkloadTimer with mark(name), a
+span(name) context manager and resolve() -> {"marks": {name: {host_ns,
+gpu_ms_from_t1}}, "spans": [{name, host_start_ns, host_end_ns, gpu_ms}]}.
+Host times are time.monotonic_ns(); GPU times are CUDA events with
+enable_timing on the current stream, read only by resolve() after the
+output exists. A name is recorded once (first occurrence).
+
+GPUWorker.execute_forward attaches a timer as req.extra["wl_timer"] when
+the request asks for it (req.extra["workload_timing"] is True) or
+SGLANG_WL_TIMER=1, marks t1_dispatch at entry (single-request batches)
+and stores the resolved dict as req.extra["wl_timing"] after the forward.
+rgb_ready is marked once return_frames has materialized the output as
+uint8 [F, H, W, 3] CPU frames (the existing CPU uint8 path). The decoding
+stage marks vae_begin / vae_end around the VAE decode (context and new
+latents of output="new"). The causal denoising stage marks
+t2_first_new_denoise in _forward_causal_transformer immediately before
+the first forward that is not a clean forward: every clean (context,
+recache, warm-up) forward enters _causal_kv_capture_scope, which now
+counts them, so restored blocks, a LongLive 1.0 recache or a replayed
+history never set it.
+
+Requests without a timer record nothing and run the same code paths;
+outputs are unchanged. New unit test test/unit/test_wl_timer.py.
+---
+ .../runtime/managers/gpu_worker.py            |  23 +-
+ .../pipelines_core/stages/causal_denoising.py |  29 +-
+ .../runtime/pipelines_core/stages/decoding.py |   7 +
+ .../runtime/utils/workload_timer.py           | 208 ++++++++++
+ .../multimodal_gen/test/unit/test_wl_timer.py | 383 ++++++++++++++++++
+ 5 files changed, 647 insertions(+), 3 deletions(-)
+ create mode 100644 python/sglang/multimodal_gen/runtime/utils/workload_timer.py
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_wl_timer.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+index b71c21305a..f468428eba 100644
+--- a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
++++ b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+@@ -114,6 +114,13 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
+     init_diffusion_tracing,
+     trace_slice,
+ )
++from sglang.multimodal_gen.runtime.utils.workload_timer import (
++    RGB_READY,
++    T1_DISPATCH,
++    WL_TIMING_KEY,
++    attach_workload_timer,
++    wl_mark,
++)
+ from sglang.srt.environ import third_party_cache_defaults
+ from sglang.srt.utils.network import NetworkAddress
+ 
+@@ -570,6 +577,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+                 Used by disaggregated pipelines to access intermediate tensors.
+         """
+         assert self.pipeline is not None
++        # opt-in workload timer (req.extra["workload_timing"] / SGLANG_WL_TIMER=1):
++        # None for other requests, which then record nothing
++        wl_timer = attach_workload_timer(batch[0]) if len(batch) == 1 else None
++        if wl_timer is not None:
++            wl_timer.mark(T1_DISPATCH)
+         # request boundary: the IPC watchdog flag is a device read, illegal
+         # inside a graph capture and too costly per exchange
+         IPC_A2A.check_timeout()
+@@ -588,7 +600,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+         if self.causal_kv_backend is not None:
+             # first-new-chunk accounting of session requests (worker clock)
+             req.extra["causal_kv_dispatched_at"] = time.perf_counter()
+-        return self._execute_forward_common(
++        result = self._execute_forward_common(
+             req,
+             forward_fn=lambda: self.pipeline.forward(req, self.server_args),
+             log_reqs=[req],
+@@ -598,6 +610,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+             ),
+             error_context=f"request {req.request_id}",
+         )
++        if wl_timer is not None:
++            # after the output exists (a returned RGB copy has synchronized)
++            try:
++                req.extra[WL_TIMING_KEY] = wl_timer.resolve()
++            except Exception:  # telemetry must never fail a finished request
++                logger.warning("Workload timer could not be resolved", exc_info=True)
++        return result
+ 
+     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
+         """Yield grouped results after each request finishes its terminal stage."""
+@@ -1016,6 +1035,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+             self._materialize_frame_output(output, output_batch, req)
+             for output in output_batch.output
+         ]
++        # the uint8 RGB is on the CPU (a device output's .cpu() copy has synchronized)
++        wl_mark(req, RGB_READY)
+         if output_batch.metrics is not None:
+             if (
+                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+index 61f22e2686..f848ac24cc 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+@@ -54,6 +54,10 @@ from sglang.multimodal_gen.runtime.utils.precision import (
+ from sglang.multimodal_gen.runtime.utils.precision import (
+     autocast_enabled as precision_autocast_enabled,
+ )
++from sglang.multimodal_gen.runtime.utils.workload_timer import (
++    T2_FIRST_NEW_DENOISE,
++    workload_timer,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -161,6 +165,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
+     _causal_kv_backend: Any = None
+     _causal_kv_pending: tuple[Any, CausalKVChunk | CausalKVRecache] | None = None
+     _causal_kv_cache_frames_override: int | None = None
++    # Clean (context / recache / warm-up) forwards in flight: never the
++    # workload timer's first denoise forward (``t2_first_new_denoise``).
++    _causal_clean_forwards: int = 0
+ 
+     def default_workload_iterations(
+         self, batch: Req, num_inference_steps: int
+@@ -242,9 +249,22 @@ class CausalDMDDenoisingStage(DenoisingStage):
+     def _causal_kv_capture_scope(self, kv_cache):
+         pending = self._causal_kv_pending
+         if pending is None:
+-            return nullcontext()
++            return self._causal_clean_forward(nullcontext())
+         run, target = pending
+-        return causal_kv_capture_scope(run, target, kv_cache)
++        return self._causal_clean_forward(
++            causal_kv_capture_scope(run, target, kv_cache)
++        )
++
++    @contextmanager
++    def _causal_clean_forward(self, scope):
++        """Run ``scope`` as a clean forward (every clean forward enters
++        ``_causal_kv_capture_scope``); only bookkeeping for the workload timer."""
++        self._causal_clean_forwards += 1
++        try:
++            with scope as value:
++                yield value
++        finally:
++            self._causal_clean_forwards -= 1
+ 
+     @contextmanager
+     def _causal_kv_recache_scope(self, run, recache: CausalKVRecache):
+@@ -967,6 +987,11 @@ class CausalDMDDenoisingStage(DenoisingStage):
+     ) -> torch.Tensor:
+         if self._component_residency_manager is not None:
+             self._manage_dit_use_site(self.transformer, "transformer", batch)
++        timer = workload_timer(batch)
++        if timer is not None and not self._causal_clean_forwards:
++            # the request's first denoise forward: that of its first block not
++            # restored, after the restore, prompt transition and recache forwards
++            timer.mark(T2_FIRST_NEW_DENOISE)
+         with (
+             precision_autocast_context(
+                 target_dtype,
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
+index 995ec93717..2a7cf6c1a7 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
+@@ -50,6 +50,11 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
+     ActiveTargetCompiledCallable,
+     resolve_torch_compile_kwargs,
+ )
++from sglang.multimodal_gen.runtime.utils.workload_timer import (
++    VAE_BEGIN,
++    VAE_END,
++    wl_mark,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -372,9 +377,11 @@ class DecodingStage(PipelineStage):
+                 quality_allows_kernel_fusions(batch.sampling_params.quality),
+             ), causal_kv_memory_critical_section("vae_decode", batch):
+                 latents, keep_latents = _causal_kv_decode_window(batch)
++                wl_mark(batch, VAE_BEGIN)  # opt-in workload timer (no-op without one)
+                 frames = self.decode(latents, server_args, vae_dtype=vae_dtype)
+                 if keep_latents is not None:
+                     frames = _keep_last_latent_frames(frames, latents, keep_latents)
++                wl_mark(batch, VAE_END)
+ 
+                 # decode trajectory latents if needed
+                 if batch.return_trajectory_decoded:
+diff --git a/python/sglang/multimodal_gen/runtime/utils/workload_timer.py b/python/sglang/multimodal_gen/runtime/utils/workload_timer.py
+new file mode 100644
+index 0000000000..2a134b1a03
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/utils/workload_timer.py
+@@ -0,0 +1,208 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Opt-in per-request timer for the workload-v2 benchmark (marks and spans; no ReelCache import).
++
++The GPU worker attaches a :class:`WorkloadTimer` as ``req.extra["wl_timer"]`` when the request asks for it
++(``req.extra["workload_timing"] is True``) or the environment sets ``SGLANG_WL_TIMER=1``; requests without it
++record nothing and run exactly as before. With a timer:
++
++* marks (the first occurrence of a name counts):
++
++  - ``t1_dispatch``: ``GPUWorker.execute_forward`` entry (single-request batches);
++  - ``t2_first_new_denoise``: the causal denoising stage, immediately before the request's first denoise forward,
++    i.e. that of the first block that was not restored, after the restore, prompt transition and recache forwards
++    were issued (clean forwards never count);
++  - ``vae_begin`` / ``vae_end``: the decoding stage, around the VAE decode (context and new latents);
++  - ``rgb_ready``: the worker, once the output's uint8 RGB ``[F, H, W, 3]`` is on the CPU (``return_frames``);
++
++* spans: ``text_encode`` (a text-encoder call, or a text-embedding cache miss) and ``text_encode_cached`` (a
++  text-embedding cache hit).
++
++Host times are ``time.monotonic_ns()`` (CLOCK_MONOTONIC: comparable across processes on one node). GPU times come
++from CUDA events with ``enable_timing`` recorded on the current stream; they are read only by :meth:`resolve`,
++after the request's output exists (the RGB copy to the CPU has synchronized), so recording adds no
++synchronization. The worker stores the resolved dict as ``req.extra["wl_timing"]``::
++
++    {"marks": {name: {"host_ns": int, "gpu_ms_from_t1": float | None}},
++     "spans": [{"name": str, "host_start_ns": int, "host_end_ns": int, "gpu_ms": float | None}]}
++
++``gpu_ms_from_t1`` is the GPU time from the ``t1_dispatch`` event to the mark's event (None without CUDA, without
++``t1_dispatch`` or when an event cannot be read).
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++import time
++from contextlib import contextmanager, nullcontext
++from contextvars import ContextVar
++from typing import Any, Iterator
++
++import torch
++
++WL_TIMER_KEY = "wl_timer"  # req.extra: the attached WorkloadTimer
++WL_TIMING_KEY = "wl_timing"  # req.extra: the resolved dict
++WL_TIMING_REQUEST_KEY = "workload_timing"  # req.extra: True asks for a timer
++WL_TIMER_ENV = "SGLANG_WL_TIMER"  # "1": every request gets a timer
++
++T1_DISPATCH = "t1_dispatch"
++T2_FIRST_NEW_DENOISE = "t2_first_new_denoise"
++VAE_BEGIN = "vae_begin"
++VAE_END = "vae_end"
++RGB_READY = "rgb_ready"
++TEXT_ENCODE = "text_encode"
++TEXT_ENCODE_CACHED = "text_encode_cached"
++
++_TRUE = ("1", "true", "yes", "on")
++
++
++class WorkloadTimer:
++    """Marks and spans of one request: host ``monotonic_ns`` plus CUDA events, resolved after the request."""
++
++    __slots__ = ("_cuda", "_marks", "_spans")
++
++    def __init__(self, *, cuda: bool | None = None) -> None:
++        self._cuda = torch.cuda.is_available() if cuda is None else bool(cuda)
++        self._marks: dict[str, tuple[int, Any]] = {}
++        self._spans: list[list[Any]] = []  # [name, host_start_ns, host_end_ns, start_event, end_event]
++
++    def _event(self):
++        if not self._cuda:
++            return None
++        event = torch.cuda.Event(enable_timing=True)
++        event.record()
++        return event
++
++    def mark(self, name: str) -> None:
++        """Record ``name`` now (host clock and the current stream); a name is recorded once."""
++        if name in self._marks:
++            return
++        host_ns = time.monotonic_ns()
++        self._marks[name] = (host_ns, self._event())
++
++    def has_mark(self, name: str) -> bool:
++        return name in self._marks
++
++    @contextmanager
++    def span(self, name: str) -> Iterator[None]:
++        """Time the enclosed block (host clock and the current stream); spans keep their start order."""
++        record = [name, time.monotonic_ns(), None, self._event(), None]
++        self._spans.append(record)
++        try:
++            yield
++        finally:
++            record[4] = self._event()
++            record[2] = time.monotonic_ns()
++
++    def resolve(self) -> dict[str, Any]:
++        """The plain-data timing dict (waits for the recorded events, which have completed once the request's output
++        is on the CPU)."""
++        t1 = self._marks.get(T1_DISPATCH)
++        t1_event = None if t1 is None else t1[1]
++        marks = {
++            name: {"host_ns": int(host_ns), "gpu_ms_from_t1": _elapsed_ms(t1_event, event)}
++            for name, (host_ns, event) in self._marks.items()
++        }
++        spans = [
++            {
++                "name": name,
++                "host_start_ns": int(start),
++                "host_end_ns": None if end is None else int(end),
++                "gpu_ms": _elapsed_ms(start_event, end_event),
++            }
++            for name, start, end, start_event, end_event in self._spans
++        ]
++        return {"marks": marks, "spans": spans}
++
++    # A request copy (``copy.deepcopy`` / ``dataclasses.asdict`` of a Req) shares its timer; pickling keeps the host
++    # clock only (CUDA events do not cross processes).
++    def __deepcopy__(self, memo):
++        return self
++
++    def __reduce__(self):
++        marks = {name: host_ns for name, (host_ns, _) in self._marks.items()}
++        spans = [record[:3] for record in self._spans]
++        return (_host_only_timer, (marks, spans))
++
++
++def _host_only_timer(marks: dict[str, int], spans: list[list[Any]]) -> WorkloadTimer:
++    timer = WorkloadTimer(cuda=False)
++    timer._marks = {name: (host_ns, None) for name, host_ns in marks.items()}
++    timer._spans = [list(record) + [None, None] for record in spans]
++    return timer
++
++
++def _elapsed_ms(start, end) -> float | None:
++    if start is None or end is None:
++        return None
++    try:
++        end.synchronize()
++        start.synchronize()
++        return float(start.elapsed_time(end))
++    except RuntimeError:  # e.g. an event that was never recorded, or a failed device
++        return None
++
++
++def workload_timing_requested(req: Any) -> bool:
++    """``req.extra["workload_timing"] is True`` or ``SGLANG_WL_TIMER=1``."""
++    extra = getattr(req, "extra", None)
++    if isinstance(extra, dict) and extra.get(WL_TIMING_REQUEST_KEY) is True:
++        return True
++    return os.environ.get(WL_TIMER_ENV, "").strip().lower() in _TRUE
++
++
++def attach_workload_timer(req: Any) -> WorkloadTimer | None:
++    """A fresh timer as ``req.extra["wl_timer"]`` when the request asks for one; None (and nothing touched) else."""
++    if not workload_timing_requested(req):
++        return None
++    timer = WorkloadTimer()
++    req.extra[WL_TIMER_KEY] = timer
++    return timer
++
++
++def workload_timer(batch: Any) -> WorkloadTimer | None:
++    """The timer attached to ``batch`` (a Req), or None."""
++    extra = getattr(batch, "extra", None)
++    if not extra:
++        return None
++    timer = extra.get(WL_TIMER_KEY)
++    return timer if isinstance(timer, WorkloadTimer) else None
++
++
++def wl_mark(batch: Any, name: str) -> None:
++    """``mark(name)`` on the batch's timer; nothing without one."""
++    timer = workload_timer(batch)
++    if timer is not None:
++        timer.mark(name)
++
++
++def wl_span(batch: Any, name: str):
++    """``span(name)`` on the batch's timer; a no-op context without one."""
++    timer = workload_timer(batch)
++    return nullcontext() if timer is None else timer.span(name)
++
++
++# Code that has no batch at hand (``TextEncodingStage.encode_text``) finds the running request's timer here; the
++# stage methods decorated with ``bind_workload_timer`` set it from their batch argument.
++_CURRENT: ContextVar[WorkloadTimer | None] = ContextVar("sglang_wl_timer", default=None)
++
++
++def current_workload_timer() -> WorkloadTimer | None:
++    return _CURRENT.get()
++
++
++def bind_workload_timer(method):
++    """Decorate a stage method ``(self, batch, ...)``: the batch's timer is the current one while it runs."""
++
++    @functools.wraps(method)
++    def wrapper(self, batch, *args, **kwargs):
++        timer = workload_timer(batch)
++        if timer is None:
++            return method(self, batch, *args, **kwargs)
++        token = _CURRENT.set(timer)
++        try:
++            return method(self, batch, *args, **kwargs)
++        finally:
++            _CURRENT.reset(token)
++
++    return wrapper
+diff --git a/python/sglang/multimodal_gen/test/unit/test_wl_timer.py b/python/sglang/multimodal_gen/test/unit/test_wl_timer.py
+new file mode 100644
+index 0000000000..1880c8e05c
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_wl_timer.py
+@@ -0,0 +1,383 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Workload timer (workload-v2): opt-in marks/spans, their seams in the worker and stages, and the resolve schema.
++
++Without a timer every hook is a no-op and the code paths are unchanged; with one, ``t1_dispatch`` (worker entry),
++``t2_first_new_denoise`` (first denoise forward, never a clean context/recache forward), ``vae_begin`` / ``vae_end``
++(decoding stage) and ``rgb_ready`` (uint8 RGB on the CPU) are recorded in that order and resolved into
++``req.extra["wl_timing"]``. CUDA events are checked when a GPU is present.
++"""
++
++import contextlib
++import copy
++import pickle
++import time
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from sglang.multimodal_gen.runtime.layers.kvcache import causal_kv_backend as seam
++from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
++from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
++from sglang.multimodal_gen.runtime.pipelines_core.stages import decoding
++from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
++    CausalDMDDenoisingStage,
++)
++from sglang.multimodal_gen.runtime.utils import workload_timer as wt
++
++CUDA = torch.cuda.is_available()
++MARK_ORDER = ["t1_dispatch", "t2_first_new_denoise", "vae_begin", "vae_end", "rgb_ready"]
++
++
++@pytest.fixture(autouse=True)
++def _no_env_timer(monkeypatch):
++    monkeypatch.delenv(wt.WL_TIMER_ENV, raising=False)
++
++
++def _check_schema(resolved):
++    assert set(resolved) == {"marks", "spans"}
++    for name, mark in resolved["marks"].items():
++        assert isinstance(name, str) and set(mark) == {"host_ns", "gpu_ms_from_t1"}
++        assert type(mark["host_ns"]) is int
++        assert mark["gpu_ms_from_t1"] is None or type(mark["gpu_ms_from_t1"]) is float
++    for span in resolved["spans"]:
++        assert set(span) == {"name", "host_start_ns", "host_end_ns", "gpu_ms"}
++        assert type(span["host_start_ns"]) is int and type(span["host_end_ns"]) is int
++        assert span["host_start_ns"] <= span["host_end_ns"]
++        assert span["gpu_ms"] is None or type(span["gpu_ms"]) is float
++
++
++# --- the timer itself ------------------------------------------------------------------------------------------------
++
++
++def test_absent_timer_is_a_noop_and_touches_nothing():
++    req = SimpleNamespace(extra={})
++    assert wt.attach_workload_timer(req) is None and req.extra == {}
++    assert wt.workload_timer(req) is None
++    wt.wl_mark(req, "t1_dispatch")
++    with wt.wl_span(req, "text_encode"):
++        pass
++    assert req.extra == {}
++    for batch in (SimpleNamespace(), SimpleNamespace(extra=None), SimpleNamespace(extra={"wl_timer": "other"})):
++        assert wt.workload_timer(batch) is None
++        wt.wl_mark(batch, "vae_begin")  # no error, nothing recorded
++    assert wt.current_workload_timer() is None
++    req.extra["workload_timing"] = "yes"  # only True opts in
++    assert wt.attach_workload_timer(req) is None
++
++
++def test_opt_in_by_request_or_environment(monkeypatch):
++    req = SimpleNamespace(extra={"workload_timing": True})
++    timer = wt.attach_workload_timer(req)
++    assert isinstance(timer, wt.WorkloadTimer) and req.extra["wl_timer"] is timer
++    assert wt.workload_timer(req) is timer
++    assert wt.attach_workload_timer(req) is not timer  # every dispatch gets a fresh timer
++    plain = SimpleNamespace(extra={})
++    monkeypatch.setenv(wt.WL_TIMER_ENV, "1")
++    assert wt.attach_workload_timer(plain) is plain.extra["wl_timer"]
++    monkeypatch.setenv(wt.WL_TIMER_ENV, "0")
++    assert wt.attach_workload_timer(SimpleNamespace(extra={})) is None
++
++
++@pytest.mark.parametrize("cuda", [False] + ([True] if CUDA else []))
++def test_marks_spans_order_and_resolve_schema(cuda):
++    timer = wt.WorkloadTimer(cuda=cuda)
++    device = "cuda" if cuda else "cpu"
++    work = torch.randn(256, 256, device=device)
++    timer.mark("t1_dispatch")
++    with timer.span("text_encode"):
++        work = work @ work
++    with timer.span("text_encode_cached"):
++        pass
++    for name in MARK_ORDER[1:]:
++        work = work @ work
++        timer.mark(name)
++        time.sleep(0.001)
++    timer.mark("t2_first_new_denoise")  # a name is recorded once: the first occurrence counts
++    resolved = timer.resolve()
++    _check_schema(resolved)
++    assert list(resolved["marks"]) == MARK_ORDER
++    hosts = [resolved["marks"][name]["host_ns"] for name in MARK_ORDER]
++    assert hosts == sorted(hosts) and len(set(hosts)) == len(hosts)
++    assert [span["name"] for span in resolved["spans"]] == ["text_encode", "text_encode_cached"]
++    gpu = [resolved["marks"][name]["gpu_ms_from_t1"] for name in MARK_ORDER]
++    if cuda:
++        assert gpu[0] == 0.0 and gpu == sorted(gpu) and all(value >= 0.0 for value in gpu)
++        assert all(span["gpu_ms"] >= 0.0 for span in resolved["spans"])
++    else:
++        assert gpu == [None] * len(MARK_ORDER)
++        assert [span["gpu_ms"] for span in resolved["spans"]] == [None, None]
++    assert timer.resolve() == resolved  # idempotent
++
++
++def test_marks_without_t1_have_no_gpu_offset_and_spans_close_on_errors():
++    timer = wt.WorkloadTimer(cuda=CUDA)
++    timer.mark("vae_begin")
++    with pytest.raises(RuntimeError):
++        with timer.span("text_encode"):
++            raise RuntimeError("encoder failed")
++    resolved = timer.resolve()
++    _check_schema(resolved)
++    assert resolved["marks"]["vae_begin"]["gpu_ms_from_t1"] is None
++    assert resolved["spans"][0]["name"] == "text_encode"
++
++
++def test_copies_share_the_timer_and_pickles_keep_the_host_clock():
++    timer = wt.WorkloadTimer(cuda=CUDA)
++    timer.mark("t1_dispatch")
++    with timer.span("text_encode"):
++        pass
++    req = SimpleNamespace(extra={"wl_timer": timer})
++    assert copy.deepcopy(req).extra["wl_timer"] is timer
++    clone = pickle.loads(pickle.dumps(timer))
++    resolved = clone.resolve()
++    assert resolved["marks"]["t1_dispatch"]["host_ns"] == timer.resolve()["marks"]["t1_dispatch"]["host_ns"]
++    assert resolved["marks"]["t1_dispatch"]["gpu_ms_from_t1"] is None
++    assert [span["name"] for span in resolved["spans"]] == ["text_encode"]
++
++
++def test_bound_timer_is_current_only_inside_the_stage_method():
++    seen = []
++
++    class Stage:
++        @wt.bind_workload_timer
++        def forward(self, batch, server_args):
++            seen.append(wt.current_workload_timer())
++            return batch
++
++    timer = wt.WorkloadTimer(cuda=False)
++    Stage().forward(SimpleNamespace(extra={"wl_timer": timer}), None)
++    Stage().forward(SimpleNamespace(extra={}), None)
++    assert seen == [timer, None] and wt.current_workload_timer() is None
++
++
++# --- t2: the first denoise forward, never a clean (context / recache) forward ------------------------------------
++
++
++class _Transformer:
++    def __init__(self, timer=None):
++        self.calls = []
++        self.timer = timer
++
++    def __call__(self, latents, prompt_embeds, timestep, **kwargs):
++        has_t2 = self.timer is not None and self.timer.has_mark("t2_first_new_denoise")
++        self.calls.append((kwargs["start_frame"], has_t2))
++        return latents * 2
++
++
++def _stage(transformer):
++    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
++    stage.transformer = transformer
++    stage._component_residency_manager = None
++    return stage
++
++
++def _forward(stage, batch, start_frame):
++    return stage._forward_causal_transformer(
++        batch,
++        latent_model_input=torch.ones(1, 2),
++        prompt_embeds=None,
++        timestep=torch.zeros(1),
++        kv_cache=None,
++        crossattn_cache=None,
++        current_start_tokens=0,
++        start_frame=start_frame,
++        image_kwargs={},
++        pos_cond_kwargs={},
++        current_timestep=0,
++        attn_metadata=None,
++        target_dtype=torch.float32,
++        autocast_enabled=False,
++    )
++
++
++class _CaptureRun:
++    def stream_of(self, kv_cache):
++        return "cond"
++
++    def end_clean_forward(self, capture):
++        pass
++
++
++def test_t2_skips_clean_forwards_and_marks_the_first_denoise_forward():
++    timer = wt.WorkloadTimer(cuda=False)
++    batch = SimpleNamespace(extra={"wl_timer": timer})
++    stage = _stage(_Transformer(timer))
++    # restored history is installed by the backend; a recache (or replay) forward runs as a clean forward
++    with stage._causal_kv_capture_scope("kv"):
++        _forward(stage, batch, start_frame=0)
++    # a captured clean forward of a session request is clean as well
++    chunk = seam.CausalKVChunk(0, 3, 3, 12, 12, 3, False, 0)
++    stage._causal_kv_pending = (_CaptureRun(), chunk)
++    with stage._causal_kv_capture_scope("kv"):
++        assert seam.active_causal_kv_capture() is not None
++        _forward(stage, batch, start_frame=3)
++    stage._causal_kv_pending = None
++    assert not timer.has_mark("t2_first_new_denoise") and stage._causal_clean_forwards == 0
++    before = time.monotonic_ns()
++    _forward(stage, batch, start_frame=6)  # the first denoise forward (first block not restored)
++    t2 = timer.resolve()["marks"]["t2_first_new_denoise"]["host_ns"]
++    assert t2 >= before
++    _forward(stage, batch, start_frame=6)  # later denoise forwards keep the first mark
++    with stage._causal_kv_capture_scope("kv"):  # and the block's clean forward does not move it
++        _forward(stage, batch, start_frame=6)
++    assert timer.resolve()["marks"]["t2_first_new_denoise"]["host_ns"] == t2
++    # the mark precedes the first denoise forward's launch; clean forwards before it never saw it
++    assert stage.transformer.calls == [(0, False), (3, False), (6, True), (6, True), (6, True)]
++
++
++def test_clean_forward_scope_unwinds_on_errors_and_keeps_the_capture_contract():
++    stage = _stage(_Transformer())
++    with pytest.raises(RuntimeError):
++        with stage._causal_kv_capture_scope("kv"):
++            raise RuntimeError("forward failed")
++    assert stage._causal_clean_forwards == 0
++    with stage._causal_kv_capture_scope("kv") as value:
++        assert value is None and stage._causal_clean_forwards == 1
++    events = []
++
++    class Run(_CaptureRun):
++        def end_clean_forward(self, capture):
++            events.append(capture.chunk.index)
++
++    stage._causal_kv_pending = (Run(), seam.CausalKVChunk(4, 0, 3, 0, 12, 0, False, 0))
++    with stage._causal_kv_capture_scope("kv") as scope:
++        assert seam.active_causal_kv_capture() is scope
++    with pytest.raises(RuntimeError):
++        with stage._causal_kv_capture_scope("kv"):
++            raise RuntimeError("capture failed")
++    assert events == [4] and seam.active_causal_kv_capture() is None and stage._causal_clean_forwards == 0
++
++
++def test_without_timer_the_forward_is_unchanged():
++    stage = _stage(_Transformer())
++    batch = SimpleNamespace(extra={})
++    out = _forward(stage, batch, start_frame=0)
++    assert torch.equal(out, torch.full((1, 2), 2.0)) and batch.extra == {}
++
++
++# --- decoding stage: vae_begin / vae_end around the decode -----------------------------------------------------------
++
++
++def _decode_batch(extra):
++    return SimpleNamespace(
++        request_id="r1",
++        extra=extra,
++        latents=torch.ones(1, 1, 2, 1, 1),
++        sampling_params=SimpleNamespace(quality=None),
++        return_trajectory_decoded=False,
++        trajectory_timesteps=None,
++        trajectory_latents=None,
++        rollout_trajectory_data=None,
++        metrics=None,
++        usage=None,
++    )
++
++
++def test_decoding_stage_marks_the_vae_decode(monkeypatch):
++    stage = object.__new__(decoding.DecodingStage)
++    stage.component_name = "vae"
++    stage.vae = object()
++    seen = []
++
++    @contextlib.contextmanager
++    def declared(self, component_name, module):
++        yield module
++
++    def decode(self, latents, server_args, vae_dtype=None):
++        timer = wt.workload_timer(batch)
++        seen.append(None if timer is None else sorted(timer.resolve()["marks"]))
++        return latents * 0.5
++
++    monkeypatch.setattr(decoding.DecodingStage, "load_model", lambda self: None)
++    monkeypatch.setattr(decoding.DecodingStage, "use_declared_component", declared)
++    monkeypatch.setattr(decoding.DecodingStage, "decode", decode)
++    monkeypatch.setattr(decoding, "resolve_decode_precision", lambda *a, **k: torch.float32)
++    monkeypatch.setattr(decoding, "use_vae_fast_path", lambda vae, allowed: contextlib.nullcontext())
++    monkeypatch.setattr(decoding, "quality_allows_kernel_fusions", lambda q: False)
++    server_args = SimpleNamespace(pipeline_config=SimpleNamespace(post_decoding=lambda frames, args: frames))
++
++    batch = _decode_batch({})
++    plain = decoding.DecodingStage.forward(stage, batch, server_args)
++    timer = wt.WorkloadTimer(cuda=False)
++    batch = _decode_batch({"wl_timer": timer})
++    timed = decoding.DecodingStage.forward(stage, batch, server_args)
++    assert seen == [None, ["vae_begin"]]
++    assert list(timer.resolve()["marks"]) == ["vae_begin", "vae_end"]
++    assert torch.equal(plain.output, timed.output) and isinstance(timed, OutputBatch)
++
++
++# --- worker: t1 at dispatch, rgb_ready after the uint8 copy, the resolved dict in req.extra["wl_timing"] ----------
++
++
++def _worker(forward):
++    worker = GPUWorker.__new__(GPUWorker)
++    worker.pipeline = SimpleNamespace(forward=forward)
++    worker.server_args = SimpleNamespace()
++    worker.causal_kv_backend = None
++    worker.is_output_rank = True
++
++    def common(req, *, forward_fn, return_req, **kwargs):
++        output = forward_fn()
++        worker._materialize_frame_outputs_for_return(output, req)
++        return output
++
++    worker._execute_forward_common = common
++    return worker
++
++
++def _req(**extra):
++    return SimpleNamespace(
++        request_id="r1",
++        is_warmup=False,
++        extra=dict(extra),
++        return_frames=True,
++        enable_frame_interpolation=False,
++        enable_upscaling=False,
++    )
++
++
++@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if CUDA else []))
++def test_worker_dispatch_rgb_and_resolved_timing(device):
++    frames = torch.rand(1, 3, 5, 4, 6, device=device)
++    marks_during_forward = []
++
++    def forward(req, server_args):
++        timer = wt.workload_timer(req)
++        marks_during_forward.append(None if timer is None else list(timer.resolve()["marks"]))
++        if timer is not None:
++            for name in ("t2_first_new_denoise", "vae_begin", "vae_end"):
++                timer.mark(name)
++        return OutputBatch(output=frames.clone())
++
++    worker = _worker(forward)
++    plain = _req()
++    out_plain = worker.execute_forward([plain])
++    assert plain.extra == {} and marks_during_forward[-1] is None
++    timed = _req(workload_timing=True)
++    out_timed = worker.execute_forward([timed])
++    assert marks_during_forward[-1] == ["t1_dispatch"]
++    resolved = timed.extra["wl_timing"]
++    _check_schema(resolved)
++    assert list(resolved["marks"]) == MARK_ORDER
++    hosts = [resolved["marks"][name]["host_ns"] for name in MARK_ORDER]
++    assert hosts == sorted(hosts)
++    if device == "cuda":
++        gpu = [resolved["marks"][name]["gpu_ms_from_t1"] for name in MARK_ORDER]
++        assert gpu[0] == 0.0 and gpu == sorted(gpu)
++    # the uint8 [F, H, W, 3] CPU frames are the same with and without the timer
++    [rgb_plain], [rgb_timed] = out_plain.output, out_timed.output
++    assert isinstance(rgb_timed, np.ndarray) and rgb_timed.dtype == np.uint8 and rgb_timed.shape == (5, 4, 6, 3)
++    assert np.array_equal(rgb_plain, rgb_timed)
++    expected = (frames[0] * 255).clamp(0, 255).to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()
++    assert np.array_equal(rgb_timed, expected)
++
++
++def test_worker_grouped_batches_get_no_timer(monkeypatch):
++    worker = _worker(lambda req, server_args: OutputBatch(output=None))
++    worker._validate_group_forward_reqs = lambda batch: None
++    worker._execute_forward_batch = lambda batch: OutputBatch()
++    reqs = [_req(workload_timing=True), _req(workload_timing=True)]
++    worker.execute_forward(reqs)
++    assert all("wl_timer" not in req.extra and "wl_timing" not in req.extra for req in reqs)
+-- 
+2.47.1
+

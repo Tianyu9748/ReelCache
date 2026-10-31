@@ -1,0 +1,115 @@
+From ad779992b10643102bf8b87a7e3ef55c6b1a379e Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 04:40:31 -0400
+Subject: [PATCH 26/26] [Diffusion] Causal KV metadata: identity test
+
+The workload metadata is required for W1a: request_id (SGLang's request
+id; the runner sets SamplingParams.request_id), generation_index and
+workload (from req.extra["workload"]) reach the backend on
+CausalKVRequest. New test: three real requests that differ only in those
+three fields (one without any) give the same conditioning identity, the
+same CausalKVRequest in every other field and the same scheduler dynamic
+batch signature (request_id is batch_sig_exclude; req.extra["workload"]
+is not read by the signature); a step-count change, the control, changes
+both. Test only; the runtime files are those of e7e4b295bf.
+---
+ .../test/unit/test_wl_request_metadata.py     | 65 +++++++++++++++++--
+ 1 file changed, 60 insertions(+), 5 deletions(-)
+
+diff --git a/python/sglang/multimodal_gen/test/unit/test_wl_request_metadata.py b/python/sglang/multimodal_gen/test/unit/test_wl_request_metadata.py
+index fce5feae82..b173bcebaa 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_wl_request_metadata.py
++++ b/python/sglang/multimodal_gen/test/unit/test_wl_request_metadata.py
+@@ -1,8 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Optional workload metadata of causal KV session requests (workload-v2).
++"""Workload metadata of causal KV session requests (workload-v2; required for W1a).
+ 
+-``req.extra["workload"]`` (plain JSON) reaches the backend as ``CausalKVRequest.generation_index`` / ``.workload``;
+-it is never part of the request's conditioning identity, and without it the request is exactly as before.
++The three fields reach the backend on ``CausalKVRequest``: ``request_id`` (SGLang's request id; the runner sets
++``SamplingParams.request_id``), ``generation_index`` and ``workload`` (from ``req.extra["workload"]``, plain JSON).
++None of them is part of the conditioning identity the backend hashes, of any other request field or of the
++scheduler's dynamic batch signature; without them the request is exactly as before.
+ """
+ 
+ import dataclasses
+@@ -12,7 +14,10 @@ from types import SimpleNamespace
+ import pytest
+ import torch
+ 
++from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+ from sglang.multimodal_gen.runtime.layers.kvcache import causal_kv_backend as seam
++from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
++from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+ from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
+     CausalDMDDenoisingStage,
+ )
+@@ -62,8 +67,8 @@ def _stage(backend):
+     return stage
+ 
+ 
+-def _begin(stage, extra):
+-    batch = SimpleNamespace(
++def _begin(stage, extra, *, batch=None):
++    batch = batch or SimpleNamespace(
+         causal_kv_session={"session_id": "s", "action": "generate"},
+         is_warmup=False,
+         extra=extra,
+@@ -115,3 +120,53 @@ def test_metadata_is_ignored_without_a_backend():
+         plain, None, ctx=None, block_sizes=[3], pos_start_base=0, use_cfg=False,
+         kv_cache=None, kv_cache_neg=None, latents=torch.zeros(1),
+     ) == (None, 0)
++
++
++def _req(request_id, workload, steps=4):
++    """A real request: ``request_id`` through SamplingParams (as the runner sends it), the rest in req.extra."""
++    params = SamplingParams(prompt="a cat on a sofa", seed=7, num_frames=21, num_inference_steps=steps,
++                            request_id=request_id,
++                            causal_kv_session={"session_id": "s", "action": "resume", "output": "new"})
++    req = Req(sampling_params=params)
++    if workload is not None:
++        req.extra["workload"] = workload
++    return req
++
++
++def _signature(req):
++    scheduler = Scheduler.__new__(Scheduler)
++    scheduler.server_args = SimpleNamespace(
++        pipeline_config=SimpleNamespace(supports_sequential_dit_inference=lambda: False)
++    )
++    return Scheduler._build_dynamic_batch_signature(scheduler, req)
++
++
++def test_request_id_generation_index_and_workload_never_change_the_identity():
++    """All three metadata fields differ between the requests (or are absent); the conditioning identity the backend
++    hashes, every other CausalKVRequest field and the scheduler's dynamic batch signature are the same."""
++    backend = _Backend()
++    stage = _stage(backend)
++    reqs = [
++        _req("r-0001", None),  # absent: as F6
++        _req("r-0002", {"generation_index": 9, "request_id": "r-0002", "k": 0}),
++        _req("r-0003", {"generation_index": 31, "request_id": "r-0003", "k": 4, "session_tree": "t7",
++                        "planned": {"source": "n12", "output": "n31"}}),
++    ]
++    for req in reqs:
++        assert _begin(stage, None, batch=req) == (None, 0)
++    requests = backend.requests
++    assert [r.request_id for r in requests] == ["r-0001", "r-0002", "r-0003"]
++    assert [r.generation_index for r in requests] == [None, 9, 31]
++    assert requests[0].workload is None and requests[2].workload["planned"] == {"source": "n12", "output": "n31"}
++    assert "request_id" not in requests[0].conditioning and "workload" not in requests[0].conditioning
++    assert requests[0].conditioning["seed"] == 7  # the identity is the real sampling-param identity
++    strip = dict(request_id=None, generation_index=None, workload=None)
++    assert all(dataclasses.replace(r, **strip) == dataclasses.replace(requests[0], **strip) for r in requests)
++    assert all(r.conditioning == requests[0].conditioning for r in requests)
++    signatures = [_signature(req) for req in reqs]
++    assert signatures[0] is not None and all(s == signatures[0] for s in signatures)
++    # control: a generation-affecting field (the step count) changes both
++    other = _req("r-0004", None, steps=3)
++    assert _signature(other) != signatures[0]
++    assert _begin(stage, None, batch=other) == (None, 0)
++    assert backend.requests[-1].conditioning != requests[0].conditioning
+-- 
+2.47.1
+

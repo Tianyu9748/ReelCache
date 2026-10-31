@@ -1,0 +1,81 @@
+From d8aca092dc272b0db5b13e61811855bda17a292a Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 00:59:30 -0400
+Subject: [PATCH 13/26] [Diffusion] Causal KV seam: session providers for
+ pipelines without causal stages
+
+A pipeline that hosts sessions behind its own seam (no causal denoising stage,
+e.g. a conditioning-cache continuation pipeline) declares
+reelcache_session_provider ("module:function"); with --reelcache-enable the backend
+factory then returns that provider, which serves the same worker interface
+(control, inflight_control, set_boundary_hook) to the scheduler and the
+session endpoints. Pipelines with neither still fail explicitly at startup.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_kv_backend.py       |  8 +++++-
+ .../unit/test_causal_kv_session_controls.py   | 25 +++++++++++++++++++
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+index 493cc03211..22efe951fb 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+@@ -341,6 +341,9 @@ def attach_causal_kv_backend(pipeline: Any, server_args: Any) -> CausalKVBackend
+ 
+     Returns None (and imports nothing) unless ``--reelcache-enable`` was given.
+     An explicitly enabled backend that cannot be imported or attached raises.
++    A pipeline without causal stages that declares ``reelcache_session_provider``
++    (``"module:function"``) gets the backend factory's session provider instead
++    (session controls through the same worker interface).
+     """
+     args = getattr(server_args, "reelcache_config", None)
+     if args is None or not args.enabled:
+@@ -355,7 +358,10 @@ def attach_causal_kv_backend(pipeline: Any, server_args: Any) -> CausalKVBackend
+         for stage in getattr(pipeline, "stages", ())
+         if callable(getattr(stage, "set_causal_kv_backend", None))
+     ]
+-    if not stages:
++    # A pipeline without causal stages may still host sessions through its own
++    # seam (e.g. a conditioning cache) by naming a provider the backend loads.
++    provider = getattr(pipeline, "reelcache_session_provider", None)
++    if not stages and provider is None:
+         raise ReelCacheUnavailableError(
+             f"--reelcache-enable was requested but {type(pipeline).__name__} has no causal "
+             "KV archive seam (only causal denoising stages support it)"
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+index ac3dc8202b..d407aab1c1 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+@@ -423,3 +423,28 @@ def test_control_request_round_trips_as_plain_data():
+     )
+     assert decoded == req and CausalKVSessionControlReq(op="list").args == {}
+     asyncio.run(asyncio.sleep(0))
++
++
++def test_provider_pipelines_attach_the_backend_without_causal_stages(monkeypatch):
++    made = []
++    fake = SimpleNamespace(
++        create_sglang_backend=lambda **kwargs: made.append(kwargs) or "provider-backend"
++    )
++    real_import = seam.importlib.import_module
++    monkeypatch.setattr(
++        seam.importlib,
++        "import_module",
++        lambda name: (
++            fake if name == "reelcache.integrations.sglang" else real_import(name)
++        ),
++    )
++    args = SimpleNamespace(
++        reelcache_config=ReelCacheArgs(enabled=True, config={"store_root": "s"})
++    )
++    pipeline = SimpleNamespace(stages=[], reelcache_session_provider="pkg.module:create")
++    assert seam.attach_causal_kv_backend(pipeline, args) == "provider-backend"
++    assert made[0]["pipeline"] is pipeline and made[0]["config"]["store_root"] == "s"
++    from sglang.multimodal_gen.configs.reelcache import ReelCacheUnavailableError
++
++    with pytest.raises(ReelCacheUnavailableError):
++        seam.attach_causal_kv_backend(SimpleNamespace(stages=[]), args)
+-- 
+2.47.1
+

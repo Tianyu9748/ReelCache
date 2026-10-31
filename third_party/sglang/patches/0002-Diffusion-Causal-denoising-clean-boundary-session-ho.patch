@@ -1,0 +1,524 @@
+From c08bb6769320dfc9a7be3d3a41029114668bc9aa Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 16:13:37 -0400
+Subject: [PATCH 02/26] [Diffusion] Causal denoising: clean-boundary session
+ hooks for KV archive backends
+
+CausalDMDDenoisingStage and LongLive2CausalDenoisingStage accept an attached
+causal KV backend (set_causal_kv_backend; class default None):
+
+- A request carrying a causal_kv_session handle opens a backend run that may
+  install restored history (latents, RNG state, cache slots) and returns the
+  number of leading blocks to skip.
+- Only the clean context forward of a block opens a capture scope (per CFG
+  stream); denoising-step forwards are never captured.
+- After each block (and its scene-cut pinning) the run commits the block and
+  may pause at that clean boundary; a paused request outputs the generated
+  blocks only. Failures are reported to the run before re-raising.
+- LongLive2's multi-shot RoPE offset is factored into
+  _causal_rope_start_frame so captured chunks record the exact RoPE position.
+
+Requests without a session handle, and stages without a backend, run the
+unchanged dense path.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../pipelines_core/stages/causal_denoising.py | 285 ++++++++++++++++--
+ .../stages/model_specific_stages/longlive2.py |  83 +++--
+ 2 files changed, 328 insertions(+), 40 deletions(-)
+
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+index ff9aeba24a..8994c14ff0 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+@@ -1,8 +1,11 @@
+ # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+ 
++import dataclasses
++import json
+ from collections.abc import Callable
+-from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
+ from dataclasses import dataclass
++from enum import Enum
+ from typing import Any
+ 
+ import torch  # type: ignore
+@@ -12,6 +15,13 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import
+     CausalSelfAttentionKVCache,
+     CrossAttentionKVCache,
+ )
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import (
++    CausalKVChunk,
++    CausalKVRequest,
++    CausalKVRestoreTarget,
++    causal_kv_capture_scope,
++    validate_causal_kv_session,
++)
+ from sglang.multimodal_gen.runtime.layers.kvcache.qvg_packed_cache import (
+     QVGPackedCausalKVCache,
+ )
+@@ -145,6 +155,11 @@ class CausalDMDRealtimeCacheContext:
+ 
+ 
+ class CausalDMDDenoisingStage(DenoisingStage):
++    # Optional causal KV archive backend (``--reelcache-enable``). None keeps the
++    # dense path unchanged; class defaults also cover stages built with __new__.
++    _causal_kv_backend: Any = None
++    _causal_kv_pending: tuple[Any, CausalKVChunk] | None = None
++
+     def default_workload_iterations(
+         self, batch: Req, num_inference_steps: int
+     ) -> int | None:
+@@ -180,6 +195,198 @@ class CausalDMDDenoisingStage(DenoisingStage):
+         self._causal_attn_metadata_builder_cls = None
+         self._causal_attn_metadata_builder = None
+ 
++    # --- optional causal KV archive backend ------------------------------------
++
++    _CAUSAL_KV_IDENTITY_EXCLUDE = frozenset(
++        {
++            "request_id",
++            "prompt_path",
++            "output_path",
++            "output_file_name",
++            "output_quality",
++            "output_compression",
++            "num_frames",
++            "num_frames_round_down",
++            "supported_resolutions",
++            "profile",
++            "num_profiled_timesteps",
++            "profile_all_stages",
++            "debug",
++            "perf_dump_path",
++            "save_output",
++            "return_frames",
++            "return_file_paths_only",
++            "suppress_logs",
++            "no_override_protected_fields",
++            "causal_kv_session",
++            "enable_frame_interpolation",
++            "frame_interpolation_exp",
++            "frame_interpolation_scale",
++            "frame_interpolation_model_path",
++            "enable_upscaling",
++            "upscaling_model_path",
++            "upscaling_scale",
++            "return_trajectory_latents",
++            "return_trajectory_decoded",
++        }
++    )
++
++    def set_causal_kv_backend(self, backend: Any) -> None:
++        """Attach the worker's causal KV archive backend (see causal_kv_backend.py)."""
++        self._causal_kv_backend = backend
++
++    def _causal_kv_capture_scope(self, kv_cache):
++        pending = self._causal_kv_pending
++        if pending is None:
++            return nullcontext()
++        run, chunk = pending
++        return causal_kv_capture_scope(run, chunk, kv_cache)
++
++    def _causal_rope_start_frame(self, start_frame: int):
++        """Temporal RoPE start frame the transformer receives for ``start_frame``."""
++        return start_frame
++
++    def _causal_kv_conditioning(self, batch: Req, server_args: ServerArgs) -> dict:
++        """JSON identity of the generation-affecting request fields (no live objects)."""
++        identity: dict[str, Any] = {"model_path": server_args.model_path}
++        params = batch.sampling_params
++        if params is not None and dataclasses.is_dataclass(params):
++            for item in dataclasses.fields(params):
++                if item.name in self._CAUSAL_KV_IDENTITY_EXCLUDE:
++                    continue
++                value = getattr(params, item.name, None)
++                if isinstance(value, Enum):
++                    value = value.value
++                try:
++                    identity[item.name] = json.loads(json.dumps(value))
++                except (TypeError, ValueError):
++                    identity[item.name] = {"unserializable": type(value).__name__}
++        return identity
++
++    def _begin_causal_kv_run(
++        self,
++        batch: Req,
++        server_args: ServerArgs,
++        *,
++        ctx: CausalDMDForwardContext,
++        block_sizes: list[int],
++        pos_start_base: int,
++        use_cfg: bool,
++        kv_cache,
++        kv_cache_neg,
++        latents: torch.Tensor,
++    ) -> tuple[Any, int]:
++        """Open the backend run of a session request and install restored history.
++
++        Returns ``(None, 0)`` on the ordinary path. Otherwise the run and the
++        number of leading blocks already restored from the session archive.
++        """
++        backend = self._causal_kv_backend
++        if backend is None:
++            return None, 0
++        session = validate_causal_kv_session(getattr(batch, "causal_kv_session", None))
++        if session is None:
++            return None, 0
++        if latents.shape[0] != 1:
++            raise ValueError("causal KV sessions support one sample per request")
++        if getattr(batch, "image_latent", None) is not None:
++            raise NotImplementedError(
++                "causal KV sessions do not support image-conditioned warm-up yet"
++            )
++        if self._causal_sequence_shard_enabled(batch):
++            raise NotImplementedError("causal KV sessions do not support sequence sharding")
++        transformer = self.transformer
++        rope = getattr(transformer, "causal_rotary_cos_sin", None)
++        rotate_key = getattr(transformer, "causal_rotate_key", None)
++        if rope is None or rotate_key is None:
++            raise NotImplementedError(
++                f"{type(transformer).__name__} exposes no causal RoPE for restored history"
++            )
++        patch = transformer.config.patch_size
++        grid = (ctx.height // patch[-2], ctx.width // patch[-1])
++        streams = ("cond", "uncond") if use_cfg else ("cond",)
++        request = CausalKVRequest(
++            request_id=getattr(batch, "request_id", None),
++            session=session,
++            conditioning=self._causal_kv_conditioning(batch, server_args),
++            block_sizes=tuple(int(size) for size in block_sizes),
++            tokens_per_frame=int(self.num_token_per_frame),
++            grid=grid,
++            pos_start_base=int(pos_start_base),
++            streams=streams,
++            num_layers=int(self.num_transformer_blocks),
++            num_heads=int(kv_cache[0].k.shape[2]),
++            head_dim=int(kv_cache[0].k.shape[3]),
++            dtype=str(kv_cache[0].k.dtype).removeprefix("torch."),
++            model={
++                "pipeline_stage": type(self).__name__,
++                "transformer": type(transformer).__name__,
++                "model_path": server_args.model_path,
++                "num_frames_per_block": int(self.num_frames_per_block),
++                "cache_tokens": int(kv_cache[0].cache_size),
++                "sink_tokens": int(kv_cache[0].sink_tokens),
++                "global_sink_tokens": int(kv_cache[0].global_sink_tokens),
++                "attention_window_tokens": int(kv_cache[0].attention_window_size),
++            },
++        )
++        run = backend.begin_request(request)
++        if run is None:
++            return None, 0
++        device = latents.device
++        caches = {"cond": kv_cache}
++        if use_cfg:
++            caches["uncond"] = kv_cache_neg
++        try:
++            resume_blocks = run.restore(
++                CausalKVRestoreTarget(
++                    caches=caches,
++                    latents=latents,
++                    generator=batch.generator,
++                    rope_cos_sin=lambda start, frames: rope(
++                        frames, grid[0], grid[1], start_frame=start, device=device
++                    ),
++                    rotate_key=rotate_key,
++                    device=device,
++                )
++            )
++        except BaseException as exc:
++            run.finish(error=exc)
++            raise
++        return run, int(resume_blocks)
++
++    def _causal_kv_chunk(
++        self,
++        batch: Req,
++        *,
++        block_index: int,
++        start_frame: int,
++        num_frames: int,
++        pos_start_base: int,
++        scene_cut: bool,
++    ) -> CausalKVChunk:
++        tokens = num_frames * self.num_token_per_frame
++        return CausalKVChunk(
++            index=block_index,
++            start_frame=start_frame,
++            num_frames=num_frames,
++            token_start=(pos_start_base + start_frame) * self.num_token_per_frame,
++            num_tokens=tokens,
++            rope_start_frame=self._causal_rope_start_frame(start_frame),
++            scene_cut=scene_cut,
++            shot_index=self._shot_index(batch, block_index),
++        )
++
++    @contextmanager
++    def _causal_kv_run_scope(self, run):
++        """Report a failed request to the backend run; clears pending capture state."""
++        try:
++            yield
++        except BaseException as exc:
++            self._causal_kv_pending = None
++            if run is not None:
++                run.finish(error=exc)
++            raise
++
+     def _target_dtype(self) -> torch.dtype:
+         return torch.bfloat16
+ 
+@@ -860,22 +1067,23 @@ class CausalDMDDenoisingStage(DenoisingStage):
+             device=context_input.device,
+             dtype=torch.long,
+         )
+-        self._forward_causal_transformer(
+-            batch,
+-            latent_model_input=context_input.to(target_dtype),
+-            prompt_embeds=prompt_embeds,
+-            timestep=timestep,
+-            kv_cache=kv_cache,
+-            crossattn_cache=crossattn_cache,
+-            current_start_tokens=current_start_tokens,
+-            start_frame=start_frame,
+-            image_kwargs=image_kwargs,
+-            pos_cond_kwargs=pos_cond_kwargs,
+-            current_timestep=0,
+-            attn_metadata=attn_metadata,
+-            target_dtype=target_dtype,
+-            autocast_enabled=autocast_enabled,
+-        )
++        with self._causal_kv_capture_scope(kv_cache):
++            self._forward_causal_transformer(
++                batch,
++                latent_model_input=context_input.to(target_dtype),
++                prompt_embeds=prompt_embeds,
++                timestep=timestep,
++                kv_cache=kv_cache,
++                crossattn_cache=crossattn_cache,
++                current_start_tokens=current_start_tokens,
++                start_frame=start_frame,
++                image_kwargs=image_kwargs,
++                pos_cond_kwargs=pos_cond_kwargs,
++                current_timestep=0,
++                attn_metadata=attn_metadata,
++                target_dtype=target_dtype,
++                autocast_enabled=autocast_enabled,
++            )
+ 
+     def _warm_up_causal_context_cache(
+         self,
+@@ -1265,11 +1473,28 @@ class CausalDMDDenoisingStage(DenoisingStage):
+         def prepare_context_input(current_latents):
+             return current_latents
+ 
++        kv_run, resume_blocks = self._begin_causal_kv_run(
++            batch,
++            server_args,
++            ctx=ctx,
++            block_sizes=block_sizes,
++            pos_start_base=pos_start_base,
++            use_cfg=False,
++            kv_cache=self.causal_kv_cache,
++            kv_cache_neg=None,
++            latents=latents,
++        )
++        paused = False
++
+         # DMD loop in causal blocks
+-        with self.progress_bar(
++        with self._causal_kv_run_scope(kv_run), self.progress_bar(
+             total=len(block_sizes) * len(timesteps), batch=batch
+         ) as progress_bar:
+-            for current_num_frames in block_sizes:
++            for block_index, current_num_frames in enumerate(block_sizes):
++                if block_index < resume_blocks:
++                    # Restored from the session archive (latents and KV installed).
++                    start_index += current_num_frames
++                    continue
+                 current_latents = latents[
+                     :, :, start_index : start_index + current_num_frames, :, :
+                 ]
+@@ -1290,6 +1515,17 @@ class CausalDMDDenoisingStage(DenoisingStage):
+                 current_start_tokens = (
+                     pos_start_base + start_index
+                 ) * self.num_token_per_frame
++                kv_chunk = None
++                if kv_run is not None:
++                    kv_chunk = self._causal_kv_chunk(
++                        batch,
++                        block_index=block_index,
++                        start_frame=start_index,
++                        num_frames=current_num_frames,
++                        pos_start_base=pos_start_base,
++                        scene_cut=False,
++                    )
++                    self._causal_kv_pending = (kv_run, kv_chunk)
+                 current_latents = self._denoise_and_update_causal_block(
+                     batch,
+                     server_args,
+@@ -1311,6 +1547,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
+                     prepare_context_input=prepare_context_input,
+                     progress_bar=progress_bar,
+                 )
++                self._causal_kv_pending = None
+ 
+                 # Write back and advance
+                 latents[:, :, start_index : start_index + current_num_frames, :, :] = (
+@@ -1318,7 +1555,15 @@ class CausalDMDDenoisingStage(DenoisingStage):
+                 )
+ 
+                 start_index += current_num_frames
+-
++                if kv_run is not None and kv_run.end_chunk(kv_chunk, current_latents):
++                    paused = True
++                    break
++
++        if kv_run is not None:
++            if paused:
++                # Paused at a clean boundary: only the generated blocks are output.
++                latents = latents[:, :, :start_index]
++            batch.extra["causal_kv"] = kv_run.finish(error=None)
+         batch.latents = latents
+         return batch
+ 
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/longlive2.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/longlive2.py
+index 59e85ff0fc..0333edbab2 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/longlive2.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/longlive2.py
+@@ -251,6 +251,11 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
+         offset = float(getattr(batch, "multi_shot_rope_offset", 8.0) or 0.0)
+         self._rope_temporal_offset = shot_index * offset
+ 
++    def _causal_rope_start_frame(self, start_frame: int):
++        if self._rope_temporal_offset != 0.0:
++            return start_frame + self._rope_temporal_offset
++        return start_frame
++
+     def _forward_one_shot_common(
+         self, batch: Req, server_args: ServerArgs, *, use_cfg: bool
+     ) -> Req:
+@@ -405,8 +410,27 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
+         def prepare_context_input(current_latents):
+             return current_latents
+ 
+-        with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
++        kv_run, resume_blocks = self._begin_causal_kv_run(
++            batch,
++            server_args,
++            ctx=ctx,
++            block_sizes=block_sizes,
++            pos_start_base=pos_start_base,
++            use_cfg=use_cfg,
++            kv_cache=self.causal_kv_cache,
++            kv_cache_neg=kv_cache_neg,
++            latents=latents,
++        )
++        paused = False
++
++        with self._causal_kv_run_scope(kv_run), self.progress_bar(
++            total=len(block_sizes) * len(timesteps)
++        ) as progress_bar:
+             for block_index, current_num_frames in enumerate(block_sizes):
++                if block_index < resume_blocks:
++                    # Restored from the session archive (latents and KV installed).
++                    start_index += current_num_frames
++                    continue
+                 self._set_rope_temporal_offset(
+                     batch, self._shot_index(batch, block_index)
+                 )
+@@ -461,6 +485,17 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
+                     prepare_context_input=prepare_context_input,
+                     progress_bar=progress_bar,
+                 )
++                kv_chunk = None
++                if kv_run is not None:
++                    kv_chunk = self._causal_kv_chunk(
++                        batch,
++                        block_index=block_index,
++                        start_frame=start_index,
++                        num_frames=current_num_frames,
++                        pos_start_base=pos_start_base,
++                        scene_cut=is_scene_cut,
++                    )
++                    self._causal_kv_pending = (kv_run, kv_chunk)
+                 if use_cfg:
+                     current_latents = self._denoise_and_update_causal_block_cfg(
+                         batch,
+@@ -479,6 +514,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
+                     current_latents = self._denoise_and_update_causal_block(
+                         batch, server_args, **block_kwargs
+                     )
++                self._causal_kv_pending = None
+ 
+                 if is_scene_cut:
+                     self._pin_current_chunk(self.causal_kv_cache, current_num_frames)
+@@ -489,8 +525,16 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
+                     current_latents
+                 )
+                 start_index += current_num_frames
++                if kv_run is not None and kv_run.end_chunk(kv_chunk, current_latents):
++                    paused = True
++                    break
+ 
+         self._rope_temporal_offset = 0.0
++        if kv_run is not None:
++            if paused:
++                # Paused at a clean boundary: only the generated blocks are output.
++                latents = latents[:, :, :start_index]
++            batch.extra["causal_kv"] = kv_run.finish(error=None)
+         batch.latents = latents
+         return batch
+ 
+@@ -512,9 +556,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
+         target_dtype: torch.dtype,
+         autocast_enabled: bool,
+     ) -> torch.Tensor:
+-        rope_start_frame = start_frame
+-        if self._rope_temporal_offset != 0.0:
+-            rope_start_frame = start_frame + self._rope_temporal_offset
++        rope_start_frame = self._causal_rope_start_frame(start_frame)
+         return super()._forward_causal_transformer(
+             batch,
+             latent_model_input=latent_model_input,
+@@ -861,19 +903,20 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
+             device=context_input.device,
+             dtype=torch.float32,
+         )
+-        self._forward_causal_transformer(
+-            batch,
+-            latent_model_input=context_input.to(target_dtype),
+-            prompt_embeds=prompt_embeds,
+-            timestep=timestep,
+-            kv_cache=kv_cache,
+-            crossattn_cache=crossattn_cache,
+-            current_start_tokens=current_start_tokens,
+-            start_frame=start_frame,
+-            image_kwargs=image_kwargs,
+-            pos_cond_kwargs=pos_cond_kwargs,
+-            current_timestep=0,
+-            attn_metadata=attn_metadata,
+-            target_dtype=target_dtype,
+-            autocast_enabled=autocast_enabled,
+-        )
++        with self._causal_kv_capture_scope(kv_cache):
++            self._forward_causal_transformer(
++                batch,
++                latent_model_input=context_input.to(target_dtype),
++                prompt_embeds=prompt_embeds,
++                timestep=timestep,
++                kv_cache=kv_cache,
++                crossattn_cache=crossattn_cache,
++                current_start_tokens=current_start_tokens,
++                start_frame=start_frame,
++                image_kwargs=image_kwargs,
++                pos_cond_kwargs=pos_cond_kwargs,
++                current_timestep=0,
++                attn_metadata=attn_metadata,
++                target_dtype=target_dtype,
++                autocast_enabled=autocast_enabled,
++            )
+-- 
+2.47.1
+

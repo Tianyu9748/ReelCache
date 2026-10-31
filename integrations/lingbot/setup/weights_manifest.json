@@ -1,0 +1,332 @@
+{
+ "schema": "lingbot.weights_manifest.v1",
+ "ckpt_dir": "$LB_CKPT",
+ "revisions": {
+  "robbyant/lingbot-world-base-cam": "6fc824ffc338d64c97c77e2eb8c0f4cfc24d82bd",
+  "robbyant/lingbot-world-fast": "b7a1db2da9bd3ba675ee01c228f41db0309b981e"
+ },
+ "files": [
+  {
+   "path": "$LB_CKPT/README.md",
+   "relpath": "README.md",
+   "bytes": 7841,
+   "sha256": "3adadd0b87c4e500d2f83e4c236a7f5464f807cb2ca032452a8acbbeff8fd334",
+   "hf_repo": "robbyant/lingbot-world-base-cam",
+   "hf_revision": "6fc824ffc338d64c97c77e2eb8c0f4cfc24d82bd",
+   "hf_lfs_oid": null,
+   "hf_size": 7841,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/Wan2.1_VAE.pth",
+   "relpath": "Wan2.1_VAE.pth",
+   "bytes": 507609880,
+   "sha256": "38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981",
+   "hf_repo": "robbyant/lingbot-world-base-cam",
+   "hf_revision": "6fc824ffc338d64c97c77e2eb8c0f4cfc24d82bd",
+   "hf_lfs_oid": "38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981",
+   "hf_size": 507609880,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/configuration.json",
+   "relpath": "configuration.json",
+   "bytes": 47,
+   "sha256": "5d1cc0f912402522f05f12a681278da402004ad37006c72ecbb461c50065ec6c",
+   "hf_repo": "robbyant/lingbot-world-base-cam",
+   "hf_revision": "6fc824ffc338d64c97c77e2eb8c0f4cfc24d82bd",
+   "hf_lfs_oid": null,
+   "hf_size": 47,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/google/umt5-xxl/special_tokens_map.json",
+   "relpath": "google/umt5-xxl/special_tokens_map.json",
+   "bytes": 6623,
+   "sha256": "7b8a9f5040adb67b5805abdfd42c1f8d0f3d0e711f10726580eb3789cd0ad61d",
+   "hf_repo": "robbyant/lingbot-world-base-cam",
+   "hf_revision": "6fc824ffc338d64c97c77e2eb8c0f4cfc24d82bd",
+   "hf_lfs_oid": null,
+   "hf_size": 6623,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/google/umt5-xxl/spiece.model",
+   "relpath": "google/umt5-xxl/spiece.model",
+   "bytes": 4548313,
+   "sha256": "e3909a67b780650b35cf529ac782ad2b6b26e6d1f849d3fbb6a872905f452458",
+   "hf_repo": "robbyant/lingbot-world-base-cam",
+   "hf_revision": "6fc824ffc338d64c97c77e2eb8c0f4cfc24d82bd",
+   "hf_lfs_oid": "e3909a67b780650b35cf529ac782ad2b6b26e6d1f849d3fbb6a872905f452458",
+   "hf_size": 4548313,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/google/umt5-xxl/tokenizer.json",
+   "relpath": "google/umt5-xxl/tokenizer.json",
+   "bytes": 16837417,
+   "sha256": "6e197b4d3dbd71da14b4eb255f4fa91c9c1f2068b20a2de2472967ca3d22602b",
+   "hf_repo": "robbyant/lingbot-world-base-cam",
+   "hf_revision": "6fc824ffc338d64c97c77e2eb8c0f4cfc24d82bd",
+   "hf_lfs_oid": "6e197b4d3dbd71da14b4eb255f4fa91c9c1f2068b20a2de2472967ca3d22602b",
+   "hf_size": 16837417,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/google/umt5-xxl/tokenizer_config.json",
+   "relpath": "google/umt5-xxl/tokenizer_config.json",
+   "bytes": 61728,
+   "sha256": "ed9a3a8b0faa71a70a32847e0435fe036e6e112d4df4edb7bb48a921e344dc05",
+   "hf_repo": "robbyant/lingbot-world-base-cam",
+   "hf_revision": "6fc824ffc338d64c97c77e2eb8c0f4cfc24d82bd",
+   "hf_lfs_oid": null,
+   "hf_size": 61728,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/.gitattributes",
+   "relpath": "lingbot_world_fast/.gitattributes",
+   "bytes": 1573,
+   "sha256": "a3df118322518090845aada21547fa4d54e2aa73b27e2c1ea36c9c91345e0a93",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": null,
+   "hf_size": 1573,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/README.md",
+   "relpath": "lingbot_world_fast/README.md",
+   "bytes": 7977,
+   "sha256": "e6e711237d142db5a63719f2be0db55b6a28429d96bedc68bdc9daa19d91ccfe",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": null,
+   "hf_size": 7977,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/assets/teaser.png",
+   "relpath": "lingbot_world_fast/assets/teaser.png",
+   "bytes": 5445854,
+   "sha256": "5a5534584d6b2c42ce445930787b6a6784cf9c2d6ed4d1a78c7be3d8e15bed73",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "5a5534584d6b2c42ce445930787b6a6784cf9c2d6ed4d1a78c7be3d8e15bed73",
+   "hf_size": 5445854,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/config.json",
+   "relpath": "lingbot_world_fast/config.json",
+   "bytes": 250,
+   "sha256": "481cf6e035b2aa9c442512ca08cc69a8d371799dc4d1626426ab8714e78add47",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": null,
+   "hf_size": 250,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/diffusion_pytorch_model.safetensors.index.json",
+   "relpath": "lingbot_world_fast/diffusion_pytorch_model.safetensors.index.json",
+   "bytes": 102106,
+   "sha256": "32f0130f2ebfb8ba63d1d836dcd2d51ad29ceeb4e81c03e3d4c66c476535ce8e",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": null,
+   "hf_size": 102106,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00001-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00001-of-00016.safetensors",
+   "bytes": 4822750875,
+   "sha256": "6db4d3b1f7ea8fd639c4c21f30f3cda474da090d1486d018193eaf74cd0499d9",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "6db4d3b1f7ea8fd639c4c21f30f3cda474da090d1486d018193eaf74cd0499d9",
+   "hf_size": 4822750875,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00002-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00002-of-00016.safetensors",
+   "bytes": 4489295563,
+   "sha256": "3248eabb4ffdf6c7cafc445905aa22204eb011d8a6d2c189fb88ef893ab982b4",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "3248eabb4ffdf6c7cafc445905aa22204eb011d8a6d2c189fb88ef893ab982b4",
+   "hf_size": 4489295563,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00003-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00003-of-00016.safetensors",
+   "bytes": 4950785724,
+   "sha256": "ffd22421e6c0946dd07ff0b79312a21c6ff480fc09f879f6fdccc2315f18db4c",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "ffd22421e6c0946dd07ff0b79312a21c6ff480fc09f879f6fdccc2315f18db4c",
+   "hf_size": 4950785724,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00004-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00004-of-00016.safetensors",
+   "bytes": 4741009064,
+   "sha256": "c4ff3ffc721f803734ed2437b81c3851a01ae959a4be2c48ddf26aafb2fc99f8",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "c4ff3ffc721f803734ed2437b81c3851a01ae959a4be2c48ddf26aafb2fc99f8",
+   "hf_size": 4741009064,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00005-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00005-of-00016.safetensors",
+   "bytes": 4489398054,
+   "sha256": "fa0aafb4005f2250de58c4d66dee93c05a1c383cad5b53fd4c1f06d9a96340c7",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "fa0aafb4005f2250de58c4d66dee93c05a1c383cad5b53fd4c1f06d9a96340c7",
+   "hf_size": 4489398054,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00006-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00006-of-00016.safetensors",
+   "bytes": 4845846308,
+   "sha256": "481ca55914787e4c5c53598286b70834d2a6f68a972240fafe3874c1e5fc8c53",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "481ca55914787e4c5c53598286b70834d2a6f68a972240fafe3874c1e5fc8c53",
+   "hf_size": 4845846308,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00007-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00007-of-00016.safetensors",
+   "bytes": 4594235180,
+   "sha256": "2e5f28c3df4a34a8c3d1f18ab13bd8c8cc398e87c90aaf06dc8e3c1ee286b2c2",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "2e5f28c3df4a34a8c3d1f18ab13bd8c8cc398e87c90aaf06dc8e3c1ee286b2c2",
+   "hf_size": 4594235180,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00008-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00008-of-00016.safetensors",
+   "bytes": 4741111581,
+   "sha256": "c96c36eb9b03c87ff364c4d97dd2134269422883dcb5261b12a4db5960bdd6f6",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "c96c36eb9b03c87ff364c4d97dd2134269422883dcb5261b12a4db5960bdd6f6",
+   "hf_size": 4741111581,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00009-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00009-of-00016.safetensors",
+   "bytes": 4489295653,
+   "sha256": "9a60a32d6dc53a17dcea3e62bfb73ab0d54d94e152cdb37358a383d32e1106af",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "9a60a32d6dc53a17dcea3e62bfb73ab0d54d94e152cdb37358a383d32e1106af",
+   "hf_size": 4489295653,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00010-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00010-of-00016.safetensors",
+   "bytes": 4950785814,
+   "sha256": "44fe1586c3c8a10dc16231c76a8365df3a93785fea126400f462052bc923a05a",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "44fe1586c3c8a10dc16231c76a8365df3a93785fea126400f462052bc923a05a",
+   "hf_size": 4950785814,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00011-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00011-of-00016.safetensors",
+   "bytes": 4741009154,
+   "sha256": "454741a4887d309275c96e2a9568c5e019ea1ffee5caa755f1cf34d2976e5bed",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "454741a4887d309275c96e2a9568c5e019ea1ffee5caa755f1cf34d2976e5bed",
+   "hf_size": 4741009154,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00012-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00012-of-00016.safetensors",
+   "bytes": 4489398063,
+   "sha256": "719044e95f053de7174ea15e3ff763b7c3175476eed1f2604de3fa96c2c22097",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "719044e95f053de7174ea15e3ff763b7c3175476eed1f2604de3fa96c2c22097",
+   "hf_size": 4489398063,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00013-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00013-of-00016.safetensors",
+   "bytes": 4845846308,
+   "sha256": "830b9513f84248c36ec60ca3504fcf4c348bcc722077b08d0d06ba5c593d8a6d",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "830b9513f84248c36ec60ca3504fcf4c348bcc722077b08d0d06ba5c593d8a6d",
+   "hf_size": 4845846308,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00014-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00014-of-00016.safetensors",
+   "bytes": 4594235180,
+   "sha256": "1419e0cea2bae548a7bf3bac23e2e15cf08bd49e3f92c6fff0ea630e06b1744f",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "1419e0cea2bae548a7bf3bac23e2e15cf08bd49e3f92c6fff0ea630e06b1744f",
+   "hf_size": 4594235180,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00015-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00015-of-00016.safetensors",
+   "bytes": 4741111581,
+   "sha256": "389ea24f4f3a971faa7c416c56b437beed294bc4e7f0f644a9d67224587b205b",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "389ea24f4f3a971faa7c416c56b437beed294bc4e7f0f644a9d67224587b205b",
+   "hf_size": 4741111581,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/lingbot_world_fast/model-00016-of-00016.safetensors",
+   "relpath": "lingbot_world_fast/model-00016-of-00016.safetensors",
+   "bytes": 3651375034,
+   "sha256": "741e26f28a545ab7860c13f2913ad72ede3722e5fa14ae4156760ab10ddf99f8",
+   "hf_repo": "robbyant/lingbot-world-fast",
+   "hf_revision": "b7a1db2da9bd3ba675ee01c228f41db0309b981e",
+   "hf_lfs_oid": "741e26f28a545ab7860c13f2913ad72ede3722e5fa14ae4156760ab10ddf99f8",
+   "hf_size": 3651375034,
+   "verified_against_hf": true
+  },
+  {
+   "path": "$LB_CKPT/models_t5_umt5-xxl-enc-bf16.pth",
+   "relpath": "models_t5_umt5-xxl-enc-bf16.pth",
+   "bytes": 11361920418,
+   "sha256": "7cace0da2b446bbbbc57d031ab6cf163a3d59b366da94e5afe36745b746fd81d",
+   "hf_repo": "robbyant/lingbot-world-base-cam",
+   "hf_revision": "6fc824ffc338d64c97c77e2eb8c0f4cfc24d82bd",
+   "hf_lfs_oid": "7cace0da2b446bbbbc57d031ab6cf163a3d59b366da94e5afe36745b746fd81d",
+   "hf_size": 11361920418,
+   "verified_against_hf": true
+  }
+ ],
+ "total_bytes": 86074039163,
+ "mismatches": [],
+ "not_downloaded": "lingbot-world-base-cam high_noise_model/ and low_noise_model/ (MoE experts, ~150 GB): WanI2VFast loads only T5, VAE and WanModelFast.from_pretrained(ckpt_dir, subfolder='lingbot_world_fast')"
+}

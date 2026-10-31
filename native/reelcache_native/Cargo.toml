@@ -1,0 +1,21 @@
+[package]
+name = "reelcache_native"
+version = "0.1.0"
+edition = "2021"
+description = "Accel track C (C3): GIL-free host hot spots of ReelCache archival (HEVC NAL scanning, tile unpacking)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "reelcache_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "=0.23.5", features = ["extension-module"] }
+memchr = "2.7"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,66 @@
+From 509383b5b0328110cf49dd2ac93d124c5ccc7a28 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 16:07:32 -0400
+Subject: [PATCH 18/26] [Diffusion] Causal KV seam: overlap test with LongLive
+ 2.0's multi-shot layout (PROTOTYPE, tests only)
+
+A global sink plus a pinned shot sink (a scene cut pins its chunk), in a full window that rolls on the
+next append. The background-restore wait at the first access gives the same K/V, cursors and pin as
+the eagerly installed history. Test-only; no runtime change since a82597b232.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../test/unit/test_causal_kv_overlap.py       | 40 +++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
+index faeaf85e52..4d976309fa 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
+@@ -246,3 +246,43 @@ def test_the_span_check_decides_like_the_per_slot_check():
+         layout = cache.replay_layout([(index * CHUNK, CHUNK, index == 0) for index in range(chunks)],
+                                      next_chunk=(chunks * CHUNK, CHUNK))
+         assert _outcome(_per_slot_check, layout) is None and _outcome(_check_restored_layout, layout) is None
++
++
++def test_a_multi_shot_layout_with_a_pinned_shot_is_awaited_before_the_roll():
++    """LongLive 2.0 geometry: a global sink and a pinned shot sink (a scene cut pins its chunk), a full window that
++    rolls on the next append. The background restore (written at the wait) gives the same cache, cursors and pin as
++    the eagerly installed history."""
++
++    def multi_shot_cache():
++        shape = [1, CACHE_FRAMES * TPF, 2, 4]
++        return CausalSelfAttentionKVCache(
++            k=torch.zeros(shape), v=torch.zeros(shape),
++            global_end_index=torch.zeros(1, dtype=torch.long), local_end_index=torch.zeros(1, dtype=torch.long),
++            cache_size=CACHE_FRAMES * TPF, sink_tokens=3 * TPF, global_sink_tokens=3 * TPF)
++
++    chunks = CACHE_FRAMES // CHUNK_FRAMES + 1  # one chunk past a full buffer: eviction already happened once
++    appends = [(index * CHUNK, CHUNK, index == 2) for index in range(chunks)]  # a scene cut pins chunk 2
++    probe = multi_shot_cache()
++    layout = probe.replay_layout(appends, next_chunk=(chunks * CHUNK, CHUNK))
++    assert layout.pinned_len > 0  # the shot sink is part of the restored state
++
++    def installed(pending: bool):
++        cache = multi_shot_cache()
++        cache.install_restored_history(layout, lambda span, k, v: None)
++        fill = _fill(layout)
++        if pending:
++            cache.restore_pending = _Pending(cache, fill)
++        else:
++            fill(cache)
++        return cache
++
++    overlapped, eager = installed(True), installed(False)
++    assert (overlapped.pinned_start, overlapped.pinned_len) == (eager.pinned_start, eager.pinned_len)
++    key = torch.full((1, CHUNK, 2, 4), 7.0)
++    for cache in (overlapped, eager):
++        view = cache.update_and_get_attention_kv(key=key, value=-key, current_chunk_start=chunks * CHUNK)
++        assert view.visible_global_end == (chunks + 1) * CHUNK
++    assert overlapped.restore_pending is None
++    assert torch.equal(overlapped.k, eager.k) and torch.equal(overlapped.v, eager.v)
++    assert overlapped._read_indices() == eager._read_indices()
++    assert (overlapped.pinned_start, overlapped.pinned_len) == (eager.pinned_start, eager.pinned_len)
+-- 
+2.47.1
+

@@ -1,0 +1,723 @@
+From ca31f73e046c387a5232637fb1d6db7db78ae40c Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 16:13:37 -0400
+Subject: [PATCH 01/26] [Diffusion] Causal KV archive seam: pre-RoPE capture
+ hook and cache restore API
+
+Add an optional, disabled-by-default backend seam for causal self-attention
+KV caches (runtime/layers/kvcache/causal_kv_backend.py):
+
+- CausalWanSelfAttention hands the normalized pre-RoPE key and the value of
+  each layer to an active capture scope before _apply_rotary_emb. No scope is
+  active unless a backend opened one for a clean context forward, so the
+  dense path is unchanged (one None check, no copies).
+- Attention modules get a layer index from their transformer.
+- CausalWanTransformer3DModel.causal_rotary_cos_sin is the single source of
+  the (cos, sin) tables used by forward, so restored keys can be re-rotated
+  with the engine's own RoPE at their original positions; causal_rotate_key
+  exposes the key rotation itself.
+- CausalSelfAttentionKVCache.replay_layout replays the cache's own cursor,
+  eviction and pinned-sink logic on a CPU position shadow to compute the slot
+  layout after a sequence of chunk appends and the slots the next chunk
+  attends to; install_restored_history zeroes the live slots of a reset cache,
+  lets the backend write restored post-RoPE K / V into the attended slots and
+  sets the cursors and pinned shot sink.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_attention_cache.py  | 205 +++++++++++++
+ .../layers/kvcache/causal_kv_backend.py       | 283 ++++++++++++++++++
+ .../runtime/models/dits/causal_wanvideo.py    |  87 ++++--
+ .../runtime/models/dits/longlive2.py          |   4 +
+ 4 files changed, 555 insertions(+), 24 deletions(-)
+ create mode 100644 python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+index e42284adcc..6adc3afb8a 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+@@ -1,10 +1,63 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
++from collections.abc import Callable, Sequence
+ from dataclasses import dataclass
+ 
+ import torch
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class CausalKVSlotSpan:
++    """Cache slots ``[local_start, local_end)`` hold global tokens from ``global_start``."""
++
++    local_start: int
++    local_end: int
++    global_start: int
++
++    @property
++    def length(self) -> int:
++        return self.local_end - self.local_start
++
++
++@dataclass(frozen=True, slots=True)
++class CausalKVCacheLayout:
++    """Slot layout of a causal KV cache at a clean chunk boundary (plain data).
++
++    ``live`` maps every written slot ``[0, local_end_index)`` to its global
++    token position; ``attended`` (when computed for a next chunk) is the subset
++    of live slots that the next chunk's attention reads. Slots that are live but
++    not attended are evicted by the next append before any read.
++    """
++
++    cache_size: int
++    sink_tokens: int
++    global_sink_tokens: int
++    attention_window_size: int
++    global_end_index: int
++    local_end_index: int
++    pinned_start: int
++    pinned_len: int
++    live: tuple[CausalKVSlotSpan, ...]
++    attended: tuple[CausalKVSlotSpan, ...] | None = None
++
++
++def _position_spans(
++    positions: list[int], keep: set[int] | None = None
++) -> tuple[CausalKVSlotSpan, ...]:
++    spans: list[CausalKVSlotSpan] = []
++    start = None
++    for slot, position in enumerate(positions + [None]):
++        selected = position is not None and (keep is None or position in keep)
++        if start is not None and (
++            not selected or position != positions[start] + (slot - start)
++        ):
++            spans.append(CausalKVSlotSpan(start, slot, positions[start]))
++            start = None
++        if selected and start is None:
++            start = slot
++    return tuple(spans)
++
++
+ @dataclass(slots=True)
+ class CausalAttentionKVView:
+     k: torch.Tensor
+@@ -511,6 +564,158 @@ class CausalSelfAttentionKVCache:
+             cache_head_slice=cache_head_slice,
+         )
+ 
++    def _position_shadow(self) -> "CausalSelfAttentionKVCache":
++        """An empty CPU cache of this geometry whose keys record global token positions."""
++        if self.allow_growth:
++            raise NotImplementedError(
++                "restoring a growable causal KV cache is not supported"
++            )
++        positions = torch.full((1, self.cache_size, 1, 1), -1.0, dtype=torch.float64)
++        return CausalSelfAttentionKVCache(
++            k=positions,
++            v=positions.clone(),
++            global_end_index=torch.zeros(1, dtype=torch.long),
++            local_end_index=torch.zeros(1, dtype=torch.long),
++            global_end_index_int=0,
++            local_end_index_int=0,
++            cache_size=self.cache_size,
++            sink_tokens=self.sink_tokens,
++            attention_window_size=self.attention_window_size,
++            allow_growth=False,
++            global_sink_tokens=self.global_sink_tokens,
++        )
++
++    def replay_layout(
++        self,
++        appends: Sequence[tuple[int, int, bool]],
++        *,
++        next_chunk: tuple[int, int] | None = None,
++    ) -> CausalKVCacheLayout:
++        """Slot layout after appending ``appends`` to an empty cache of this geometry.
++
++        Replays this class's own cursor, eviction and pinned-sink logic on a CPU
++        shadow whose keys are global token positions, so a restore rebuilds
++        exactly the slots native generation holds. ``appends`` are the clean
++        chunk writes ``(token_start, num_tokens, pinned_after_write)`` in order.
++        ``next_chunk=(token_start, num_tokens)`` also computes ``attended``.
++        """
++        shadow = self._position_shadow()
++        for token_start, num_tokens, pinned in appends:
++            ids = torch.arange(
++                token_start, token_start + num_tokens, dtype=torch.float64
++            ).view(1, -1, 1, 1)
++            shadow.update_and_get_attention_kv(
++                key=ids,
++                value=ids,
++                current_chunk_start=token_start,
++                debug_name="causal KV layout replay",
++            )
++            if pinned:
++                shadow.pin_current_chunk(num_tokens)
++        global_end, local_end = shadow._read_indices()
++        positions = [int(item) for item in shadow.k[0, :local_end, 0, 0].tolist()]
++        if len(set(positions)) != len(positions) or min(positions, default=0) < 0:
++            raise RuntimeError("causal KV layout replay produced duplicate or unset slots")
++        attended = None
++        if next_chunk is not None:
++            token_start, num_tokens = next_chunk
++            probe = CausalSelfAttentionKVCache(
++                k=shadow.k.clone(),
++                v=shadow.v.clone(),
++                global_end_index=shadow.global_end_index.clone(),
++                local_end_index=shadow.local_end_index.clone(),
++                global_end_index_int=global_end,
++                local_end_index_int=local_end,
++                cache_size=shadow.cache_size,
++                sink_tokens=shadow.sink_tokens,
++                attention_window_size=shadow.attention_window_size,
++                allow_growth=False,
++                global_sink_tokens=shadow.global_sink_tokens,
++                pinned_start=shadow.pinned_start,
++                pinned_len=shadow.pinned_len,
++            )
++            ids = torch.arange(
++                token_start, token_start + num_tokens, dtype=torch.float64
++            ).view(1, -1, 1, 1)
++            view = probe.update_and_get_attention_kv(
++                key=ids,
++                value=ids,
++                current_chunk_start=token_start,
++                debug_name="causal KV next-chunk replay",
++            )
++            read = {int(item) for item in view.k[0, :, 0, 0].tolist()}
++            read -= set(range(token_start, token_start + num_tokens))
++            attended = _position_spans(positions, read)
++        return CausalKVCacheLayout(
++            cache_size=self.cache_size,
++            sink_tokens=self.sink_tokens,
++            global_sink_tokens=self.global_sink_tokens,
++            attention_window_size=self.attention_window_size,
++            global_end_index=global_end,
++            local_end_index=local_end,
++            pinned_start=shadow.pinned_start,
++            pinned_len=shadow.pinned_len,
++            live=_position_spans(positions),
++            attended=attended,
++        )
++
++    def install_restored_history(
++        self,
++        layout: CausalKVCacheLayout,
++        write: Callable[[CausalKVSlotSpan, torch.Tensor, torch.Tensor], None],
++    ) -> None:
++        """Install restored post-RoPE K and V into a freshly reset cache.
++
++        Live slots are zeroed, ``write(span, k_slots, v_slots)`` fills every
++        attended span (all live spans when ``layout.attended`` is None) through
++        ``[B, span.length, H, D]`` views of this cache, then the write cursors
++        and pinned shot sink are set, honoring the sink/window geometry.
++        """
++        if (
++            layout.cache_size,
++            layout.sink_tokens,
++            layout.global_sink_tokens,
++            layout.attention_window_size,
++        ) != (
++            self.cache_size,
++            self.sink_tokens,
++            self.global_sink_tokens,
++            self.attention_window_size,
++        ) or self.allow_growth:
++            raise ValueError("restored layout does not match this cache's geometry")
++        if self._read_indices() != (0, 0) or self._has_pinned_sink():
++            raise RuntimeError("restored history is installed only into a reset cache")
++        local_end = layout.local_end_index
++        if not 0 <= local_end <= self.cache_size or layout.global_end_index < local_end:
++            raise ValueError("restored layout cursors are outside the cache")
++        live = {
++            slot: span.global_start + slot - span.local_start
++            for span in layout.live
++            for slot in range(span.local_start, span.local_end)
++        }
++        if sorted(live) != list(range(local_end)):
++            raise ValueError("restored layout must cover exactly the live slots")
++        spans = layout.live if layout.attended is None else layout.attended
++        for span in spans:
++            if span.length <= 0 or any(
++                live.get(slot) != span.global_start + slot - span.local_start
++                for slot in (span.local_start, span.local_end - 1)
++            ):
++                raise ValueError("restored span is not part of the live layout")
++        self.k[:, :local_end].zero_()
++        self.v[:, :local_end].zero_()
++        for span in spans:
++            write(
++                span,
++                self.k[:, span.local_start : span.local_end],
++                self.v[:, span.local_start : span.local_end],
++            )
++        self._write_indices(
++            global_end_index=layout.global_end_index, local_end_index=local_end
++        )
++        self.pinned_start = layout.pinned_start
++        self.pinned_len = layout.pinned_len
++
+ 
+ @dataclass(slots=True)
+ class CrossAttentionKVCache:
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+new file mode 100644
+index 0000000000..0416adc580
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+@@ -0,0 +1,283 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Optional archive backend seam for causal self-attention KV caches.
++
++Disabled by default: no backend is attached to the causal denoising stages,
++``active_causal_kv_capture()`` returns ``None`` and the attention and denoising
++code paths do exactly what they did before (no copies, no imports). An enabled
++backend, e.g. ReelCache's ``reelcache.integrations.sglang`` (``--reelcache-enable``), is
++created once per GPU worker by :func:`attach_causal_kv_backend` and receives:
++
++* the normalized pre-RoPE ``key`` and the ``value`` of every causal
++  self-attention layer, in native dtype and ``[B, T, H, D]`` layout, during the
++  *clean* context forward of a chunk only (never denoising-step forwards, never
++  post-RoPE keys);
++* chunk-boundary callbacks (``end_chunk``) that can request a pause at the
++  clean boundary;
++* a restore target (:class:`CausalKVRestoreTarget`) through which restored
++  history is installed into ``CausalSelfAttentionKVCache`` slots with
++  ``install_restored_history`` and re-rotated with the engine's own RoPE.
++
++Everything crossing this seam is plain data or a live tensor owned by the
++worker; nothing here is serialized into requests.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import importlib
++from dataclasses import dataclass
++from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
++
++import torch
++
++# Request field (``SamplingParams.causal_kv_session``) keys understood by the seam.
++SESSION_ACTIONS = ("generate", "resume", "fork", "rewind")
++_SESSION_KEYS = {
++    "session_id",
++    "action",
++    "pause_after_chunks",
++    "from_session",
++    "checkpoint",
++    "replace",
++}
++
++
++def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
++    """Validate the plain-data session handle of a request (no backend import).
++
++    ``None`` means ordinary generation. Otherwise a JSON object with
++    ``session_id`` (str), ``action`` (one of :data:`SESSION_ACTIONS`, default
++    ``generate``), optional ``pause_after_chunks`` (positive int: pause at the
++    clean boundary after that many chunks of the session), ``from_session``
++    (fork source), ``checkpoint`` (node reference or chunk count) and
++    ``replace`` (bool, ``generate`` only). Live objects are rejected.
++    """
++    if value is None:
++        return None
++    if not isinstance(value, Mapping):
++        raise ValueError("causal_kv_session must be a JSON object or None")
++    unknown = set(value) - _SESSION_KEYS
++    if unknown:
++        raise ValueError(f"unknown causal_kv_session keys: {sorted(unknown)}")
++    session_id = value.get("session_id")
++    if not isinstance(session_id, str) or not session_id.strip() or "/" in session_id:
++        raise ValueError("causal_kv_session.session_id must be a nonempty name without '/'")
++    action = value.get("action", "generate")
++    if action not in SESSION_ACTIONS:
++        raise ValueError(f"causal_kv_session.action must be one of {SESSION_ACTIONS}")
++    pause = value.get("pause_after_chunks")
++    if pause is not None and (type(pause) is not int or pause < 1):
++        raise ValueError("causal_kv_session.pause_after_chunks must be a positive int")
++    source = value.get("from_session")
++    if (action == "fork") != (source is not None):
++        raise ValueError("causal_kv_session.from_session is required for (and only for) fork")
++    if source is not None and (not isinstance(source, str) or not source.strip()):
++        raise ValueError("causal_kv_session.from_session must be a nonempty string")
++    checkpoint = value.get("checkpoint")
++    if checkpoint is not None and not (
++        (type(checkpoint) is int and checkpoint >= 0) or isinstance(checkpoint, str)
++    ):
++        raise ValueError("causal_kv_session.checkpoint must be a node reference or chunk count")
++    if action == "rewind" and checkpoint is None:
++        raise ValueError("causal_kv_session.checkpoint is required for rewind")
++    replace = value.get("replace", False)
++    if type(replace) is not bool or (replace and action != "generate"):
++        raise ValueError("causal_kv_session.replace is a bool for generate only")
++    result = {"session_id": session_id, "action": action, "replace": replace}
++    for name, item in (
++        ("pause_after_chunks", pause),
++        ("from_session", source),
++        ("checkpoint", checkpoint),
++    ):
++        if item is not None:
++            result[name] = item
++    return result
++
++
++@dataclass(frozen=True, slots=True)
++class CausalKVChunk:
++    """One causal block of a request, in the stage's own coordinates."""
++
++    index: int  # block index within the request (0-based)
++    start_frame: int  # first latent frame of the block within the request
++    num_frames: int  # latent frames of the block
++    token_start: int  # global cache position of the block's first token
++    num_tokens: int
++    rope_start_frame: float  # temporal RoPE position passed to the transformer
++    scene_cut: bool  # pinned as a shot sink after its clean forward
++    shot_index: int
++
++
++@dataclass(frozen=True, slots=True)
++class CausalKVCapture:
++    """The clean context forward being captured: one chunk of one CFG stream."""
++
++    chunk: CausalKVChunk
++    stream: str  # "cond" or "uncond"
++
++
++@dataclass(frozen=True, slots=True)
++class CausalKVRequest:
++    """Plain description of a request handed to ``CausalKVBackend.begin_request``."""
++
++    request_id: str | None
++    session: dict[str, Any]  # validated causal_kv_session handle
++    conditioning: dict[str, Any]  # JSON identity of prompt/seed/sampling/geometry
++    block_sizes: tuple[int, ...]  # latent frames per causal block
++    tokens_per_frame: int
++    grid: tuple[int, int]  # post-patch (height, width)
++    pos_start_base: int  # warm-up frames before block 0 (token offset base)
++    streams: tuple[str, ...]  # ("cond",) or ("cond", "uncond")
++    num_layers: int
++    num_heads: int
++    head_dim: int
++    dtype: str
++    model: dict[str, Any]  # pipeline/model identity (class names, path)
++
++
++@dataclass(slots=True)
++class CausalKVRestoreTarget:
++    """Live objects a backend needs to install restored history (worker-owned)."""
++
++    caches: Mapping[str, Sequence[Any]]  # stream -> per-layer CausalSelfAttentionKVCache
++    latents: torch.Tensor  # [B, C, T, H, W] request latents (restored blocks are written)
++    generator: Any  # torch.Generator or list of them
++    rope_cos_sin: Callable[[float, int], tuple[torch.Tensor, torch.Tensor]]
++    rotate_key: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
++    device: torch.device
++
++
++class CausalKVRun(Protocol):
++    """Per-request state of an enabled backend (one request at a time per worker)."""
++
++    resume_blocks: int
++
++    def restore(self, target: CausalKVRestoreTarget) -> int: ...
++
++    def capture_layer(
++        self,
++        capture: CausalKVCapture,
++        layer_index: int,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        freqs_cis: tuple[torch.Tensor, torch.Tensor],
++    ) -> None: ...
++
++    def end_clean_forward(self, capture: CausalKVCapture) -> None: ...
++
++    def stream_of(self, kv_cache: Any) -> str: ...
++
++    def end_chunk(self, chunk: CausalKVChunk, latents: torch.Tensor) -> bool: ...
++
++    def finish(self, *, error: BaseException | None) -> dict[str, Any]: ...
++
++
++class CausalKVBackend(Protocol):
++    """Worker-owned archive backend (e.g. ReelCache's CausalWanKVBridge)."""
++
++    def begin_request(self, request: CausalKVRequest) -> CausalKVRun | None: ...
++
++    def close(self) -> None: ...
++
++
++# --- capture scope -----------------------------------------------------------
++
++_ACTIVE_CAPTURE: "_CaptureScope | None" = None
++
++
++class _CaptureScope:
++    __slots__ = ("run", "capture", "layers")
++
++    def __init__(self, run: CausalKVRun, capture: CausalKVCapture) -> None:
++        self.run = run
++        self.capture = capture
++        self.layers = 0
++
++    def capture_layer(
++        self,
++        layer_index: int | None,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        freqs_cis: tuple[torch.Tensor, torch.Tensor],
++    ) -> None:
++        if layer_index is None:
++            raise RuntimeError(
++                "causal KV capture reached an attention module without a layer index"
++            )
++        self.layers += 1
++        self.run.capture_layer(self.capture, layer_index, key, value, freqs_cis)
++
++
++def active_causal_kv_capture() -> _CaptureScope | None:
++    """The capture scope of the running clean forward, or None (always None when disabled)."""
++    return _ACTIVE_CAPTURE
++
++
++@contextlib.contextmanager
++def causal_kv_capture_scope(
++    run: CausalKVRun, chunk: CausalKVChunk, kv_cache: Any
++) -> Iterator[_CaptureScope]:
++    """Capture the clean context forward of ``chunk`` into ``kv_cache``'s stream."""
++    global _ACTIVE_CAPTURE
++    if _ACTIVE_CAPTURE is not None:
++        raise RuntimeError("causal KV capture scopes cannot be nested")
++    scope = _CaptureScope(run, CausalKVCapture(chunk, run.stream_of(kv_cache)))
++    _ACTIVE_CAPTURE = scope
++    try:
++        yield scope
++    finally:
++        _ACTIVE_CAPTURE = None
++    run.end_clean_forward(scope.capture)
++
++
++def assign_causal_attention_layer_indices(blocks: Sequence[Any]) -> None:
++    """Number the causal self-attention modules of a transformer's blocks."""
++    for index, block in enumerate(blocks):
++        attention = getattr(block, "attn1", None)
++        if attention is not None:
++            attention.layer_index = index
++
++
++# --- worker attachment ---------------------------------------------------------
++
++
++def attach_causal_kv_backend(pipeline: Any, server_args: Any) -> CausalKVBackend | None:
++    """Create the worker's archive backend and attach it to the causal stages.
++
++    Returns None (and imports nothing) unless ``--reelcache-enable`` was given.
++    An explicitly enabled backend that cannot be imported or attached raises.
++    """
++    args = getattr(server_args, "reelcache_config", None)
++    if args is None or not args.enabled:
++        return None
++    from sglang.multimodal_gen.configs.reelcache import (
++        REELCACHE_BACKEND_MODULE,
++        ReelCacheUnavailableError,
++    )
++
++    stages = [
++        stage
++        for stage in getattr(pipeline, "stages", ())
++        if callable(getattr(stage, "set_causal_kv_backend", None))
++    ]
++    if not stages:
++        raise ReelCacheUnavailableError(
++            f"--reelcache-enable was requested but {type(pipeline).__name__} has no causal "
++            "KV archive seam (only causal denoising stages support it)"
++        )
++    try:
++        module = importlib.import_module(REELCACHE_BACKEND_MODULE)
++        factory = module.create_sglang_backend
++    except Exception as exc:  # noqa: BLE001 - surfaced as an explicit startup error
++        raise ReelCacheUnavailableError(
++            f"--reelcache-enable was requested but {REELCACHE_BACKEND_MODULE} could not be "
++            f"loaded: {exc!r}"
++        ) from exc
++    backend = factory(
++        config=args.backend_config(),
++        pipeline=pipeline,
++        server_args=server_args,
++    )
++    for stage in stages:
++        stage.set_causal_kv_backend(backend)
++    return backend
+diff --git a/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py b/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py
+index c5f0e90b55..e4b78b34c1 100644
+--- a/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py
++++ b/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py
+@@ -37,6 +37,10 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import
+     CausalSelfAttentionKVCache,
+     CrossAttentionKVCache,
+ )
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import (
++    active_causal_kv_capture,
++    assign_causal_attention_layer_indices,
++)
+ from sglang.multimodal_gen.runtime.layers.layernorm import (
+     FP32LayerNorm,
+     LayerNormScaleShift,
+@@ -73,6 +77,13 @@ from sglang.srt.utils import add_prefix
+ logger = init_logger(__name__)
+ 
+ 
++def causal_wan_rotate_key(
++    key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
++) -> torch.Tensor:
++    """The key rotation of ``CausalWanSelfAttention`` (restored history reuses it)."""
++    return _apply_rotary_emb(key, cos, sin, is_neox_style=False)
++
++
+ class CausalWanSelfAttention(nn.Module):
+     def __init__(
+         self,
+@@ -99,6 +110,8 @@ class CausalWanSelfAttention(nn.Module):
+         self.qk_norm = qk_norm
+         self.eps = eps
+         self.parallel_attention = parallel_attention
++        # Set by the owning transformer; identifies this layer to a causal KV backend.
++        self.layer_index: int | None = None
+ 
+         # Scaled dot product attention
+         self.attn = LocalAttention(
+@@ -133,8 +146,12 @@ class CausalWanSelfAttention(nn.Module):
+             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+         """
+         cos, sin = freqs_cis
++        capture = active_causal_kv_capture()
++        if capture is not None:
++            # Clean context forward only: normalized pre-RoPE key and value.
++            capture.capture_layer(self.layer_index, k, v, freqs_cis)
+         roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
+-        roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
++        roped_key = causal_wan_rotate_key(k, cos, sin).type_as(v)
+ 
+         if kv_cache is None:
+             # Padding for flex attention
+@@ -445,6 +462,8 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+     param_names_mapping = WanVideoConfig().param_names_mapping
+     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
+     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
++    # Key rotation of the causal self-attention, reused for restored history.
++    causal_rotate_key = staticmethod(causal_wan_rotate_key)
+ 
+     def __init__(
+         self,
+@@ -501,6 +520,7 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+                 for i in range(config.num_layers)
+             ]
+         )
++        assign_causal_attention_layer_indices(self.blocks)
+ 
+         # 4. Output norm & projection
+         self.norm_out = LayerNormScaleShift(
+@@ -532,6 +552,42 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+             "blocks",
+         ]
+ 
++    def causal_rotary_cos_sin(
++        self,
++        post_patch_num_frames: int,
++        post_patch_height: int,
++        post_patch_width: int,
++        *,
++        start_frame: float = 0,
++        device: torch.device | str | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor] | None:
++        """The ``freqs_cis = (cos, sin)`` that ``forward`` applies to q and k.
++
++        Also used to re-rotate restored pre-RoPE keys at their original positions.
++        """
++        d = self.hidden_size // self.num_attention_heads
++        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
++        freqs_cos, freqs_sin = get_rotary_pos_embed(
++            (
++                post_patch_num_frames * get_sp_world_size(),
++                post_patch_height,
++                post_patch_width,
++            ),
++            self.hidden_size,
++            self.num_attention_heads,
++            rope_dim_list,
++            dtype=(
++                torch.float64
++                if current_platform.is_float64_supported()
++                else torch.float32
++            ),
++            rope_theta=10000,
++            start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
++        )
++        freqs_cos = freqs_cos.to(device)
++        freqs_sin = freqs_sin.to(device)
++        return (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -569,29 +625,12 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+         post_patch_width = width // p_w
+ 
+         # Get rotary embeddings
+-        d = self.hidden_size // self.num_attention_heads
+-        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
+-        freqs_cos, freqs_sin = get_rotary_pos_embed(
+-            (
+-                post_patch_num_frames * get_sp_world_size(),
+-                post_patch_height,
+-                post_patch_width,
+-            ),
+-            self.hidden_size,
+-            self.num_attention_heads,
+-            rope_dim_list,
+-            dtype=(
+-                torch.float64
+-                if current_platform.is_float64_supported()
+-                else torch.float32
+-            ),
+-            rope_theta=10000,
+-            start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
+-        )
+-        freqs_cos = freqs_cos.to(hidden_states.device)
+-        freqs_sin = freqs_sin.to(hidden_states.device)
+-        freqs_cis = (
+-            (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
++        freqs_cis = self.causal_rotary_cos_sin(
++            post_patch_num_frames,
++            post_patch_height,
++            post_patch_width,
++            start_frame=start_frame,
++            device=hidden_states.device,
+         )
+ 
+         hidden_states = self.patch_embedding(hidden_states)
+diff --git a/python/sglang/multimodal_gen/runtime/models/dits/longlive2.py b/python/sglang/multimodal_gen/runtime/models/dits/longlive2.py
+index c47acabcdf..157bfeea4f 100644
+--- a/python/sglang/multimodal_gen/runtime/models/dits/longlive2.py
++++ b/python/sglang/multimodal_gen/runtime/models/dits/longlive2.py
+@@ -11,6 +11,9 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import
+     CausalSelfAttentionKVCache,
+     CrossAttentionKVCache,
+ )
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import (
++    assign_causal_attention_layer_indices,
++)
+ from sglang.multimodal_gen.runtime.layers.layernorm import (
+     LayerNormScaleShift,
+     tensor_parallel_rms_norm,
+@@ -187,6 +190,7 @@ class LongLive2Transformer3DModel(CausalWanTransformer3DModel):
+                 for i in range(config.num_layers)
+             ]
+         )
++        assign_causal_attention_layer_indices(self.blocks)
+ 
+ 
+ EntryClass = LongLive2Transformer3DModel
+-- 
+2.47.1
+

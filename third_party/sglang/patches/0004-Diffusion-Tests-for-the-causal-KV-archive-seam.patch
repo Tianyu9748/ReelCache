@@ -1,0 +1,307 @@
+From d3bd15cdbb3b1bf4594cedc4f8e853c44d218a52 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 16:13:37 -0400
+Subject: [PATCH 04/26] [Diffusion] Tests for the causal KV archive seam
+
+Session-handle validation, disabled capture scope, ReelCache args, import
+isolation (the disabled path imports nothing from ReelCache; an enabled backend
+without ReelCache fails explicitly) and bitwise equality of the next chunk's
+attention view between a native cache and a reset cache restored through
+replay_layout/install_restored_history (LongLive2-like global sink with pinned
+scene cuts, sink only, pinned without global sink, window shorter than the
+buffer, full history), at every pause point.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../test/unit/test_causal_kv_backend.py       | 279 ++++++++++++++++++
+ 1 file changed, 279 insertions(+)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_causal_kv_backend.py
+
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_backend.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_backend.py
+new file mode 100644
+index 0000000000..7298f5e797
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_backend.py
+@@ -0,0 +1,279 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Causal KV archive backend seam: disabled path, session handles, cache layout replay/install."""
++
++import os
++import subprocess
++import sys
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.multimodal_gen.configs.reelcache import ReelCacheArgs, ReelCacheUnavailableError
++from sglang.multimodal_gen.runtime.layers.kvcache import causal_kv_backend as seam
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
++    CausalKVCacheLayout,
++    CausalSelfAttentionKVCache,
++)
++
++
++def _cache(cache_size, sink, global_sink=0, window=0, heads=2, dim=4):
++    shape = [1, cache_size, heads, dim]
++    return CausalSelfAttentionKVCache(
++        k=torch.zeros(shape),
++        v=torch.zeros(shape),
++        global_end_index=torch.zeros(1, dtype=torch.long),
++        local_end_index=torch.zeros(1, dtype=torch.long),
++        cache_size=cache_size,
++        sink_tokens=sink,
++        global_sink_tokens=global_sink,
++        attention_window_size=window,
++    )
++
++
++def _clone_cache(cache):
++    return CausalSelfAttentionKVCache(
++        k=cache.k.clone(),
++        v=cache.v.clone(),
++        global_end_index=cache.global_end_index.clone(),
++        local_end_index=cache.local_end_index.clone(),
++        global_end_index_int=cache.global_end_index_int,
++        local_end_index_int=cache.local_end_index_int,
++        cache_size=cache.cache_size,
++        sink_tokens=cache.sink_tokens,
++        attention_window_size=cache.attention_window_size,
++        allow_growth=cache.allow_growth,
++        global_sink_tokens=cache.global_sink_tokens,
++        pinned_start=cache.pinned_start,
++        pinned_len=cache.pinned_len,
++    )
++
++
++SCENARIOS = {
++    # LongLive 2.0 shape: 4-chunk buffer, 1-chunk global sink, pinned shot sinks.
++    "longlive2_multishot": dict(chunk=6, cache=24, sink=6, global_sink=6, cuts={2, 5}),
++    "sink_only": dict(chunk=6, cache=24, sink=6, global_sink=0, cuts=set()),
++    "pinned_without_global_sink": dict(chunk=6, cache=24, sink=6, global_sink=0, cuts={3}),
++    "window_shorter_than_buffer": dict(chunk=4, cache=20, sink=4, global_sink=0, cuts=set(), window=12),
++    "no_sink_full_history": dict(chunk=5, cache=40, sink=0, global_sink=0, cuts=set()),
++}
++
++
++@pytest.mark.parametrize("name", sorted(SCENARIOS))
++def test_restored_layout_matches_native_cache_bitwise(name):
++    spec = SCENARIOS[name]
++    chunk, chunks = spec["chunk"], 8
++    generator = torch.Generator().manual_seed(7)
++    native = _cache(spec["cache"], spec["sink"], spec["global_sink"], spec.get("window", 0))
++    archive, appends, states = {}, [], [_clone_cache(native)]
++    for index in range(chunks):
++        start = index * chunk
++        # One denoising-step write, then the clean write into the same slots.
++        noisy = torch.randn(1, chunk, 2, 4, generator=generator)
++        native.update_and_get_attention_kv(key=noisy, value=noisy, current_chunk_start=start)
++        key = torch.randn(1, chunk, 2, 4, generator=generator)
++        value = torch.randn(1, chunk, 2, 4, generator=generator)
++        native.update_and_get_attention_kv(key=key, value=value, current_chunk_start=start)
++        pinned = index in spec["cuts"]
++        if pinned:
++            native.pin_current_chunk(chunk)
++        archive[index] = (key, value)
++        appends.append((start, chunk, pinned))
++        states.append(_clone_cache(native))
++
++    for paused in range(1, chunks):
++        reference = states[paused]
++        next_start = paused * chunk
++        fresh = _cache(spec["cache"], spec["sink"], spec["global_sink"], spec.get("window", 0))
++        layout = fresh.replay_layout(appends[:paused], next_chunk=(next_start, chunk))
++        assert isinstance(layout, CausalKVCacheLayout)
++        assert (layout.global_end_index, layout.local_end_index) == reference._read_indices()
++        assert (layout.pinned_start, layout.pinned_len) == (
++            reference.pinned_start,
++            reference.pinned_len,
++        )
++
++        def write(span, k_slots, v_slots):
++            for offset in range(span.length):
++                position = span.global_start + offset
++                key, value = archive[position // chunk]
++                k_slots[:, offset] = key[:, position % chunk]
++                v_slots[:, offset] = value[:, position % chunk]
++
++        fresh.install_restored_history(layout, write)
++        follow = torch.randn(1, chunk, 2, 4, generator=generator)
++        expected = _clone_cache(reference).update_and_get_attention_kv(
++            key=follow, value=follow, current_chunk_start=next_start
++        )
++        restored = fresh.update_and_get_attention_kv(
++            key=follow, value=follow, current_chunk_start=next_start
++        )
++        assert torch.equal(expected.k, restored.k), (name, paused)
++        assert torch.equal(expected.v, restored.v), (name, paused)
++        assert expected.visible_global_end == restored.visible_global_end
++        attended = sum(span.length for span in layout.attended)
++        live = sum(span.length for span in layout.live)
++        assert attended <= live == reference._read_indices()[1]
++
++
++def test_install_requires_reset_cache_and_matching_geometry():
++    cache = _cache(12, 3)
++    layout = cache.replay_layout([(0, 3, False), (3, 3, False)])
++    cache.update_and_get_attention_kv(
++        key=torch.zeros(1, 3, 2, 4), value=torch.zeros(1, 3, 2, 4), current_chunk_start=0
++    )
++    with pytest.raises(RuntimeError):
++        cache.install_restored_history(layout, lambda *args: None)
++    other = _cache(16, 3)
++    with pytest.raises(ValueError):
++        other.install_restored_history(layout, lambda *args: None)
++
++
++def test_session_handle_validation():
++    assert seam.validate_causal_kv_session(None) is None
++    handle = seam.validate_causal_kv_session({"session_id": "s1", "pause_after_chunks": 1})
++    assert handle == {"session_id": "s1", "action": "generate", "replace": False, "pause_after_chunks": 1}
++    assert seam.validate_causal_kv_session(
++        {"session_id": "s2", "action": "fork", "from_session": "s1", "checkpoint": 1}
++    )["from_session"] == "s1"
++    for bad in (
++        {"session_id": ""},
++        {"session_id": "a/b"},
++        {"session_id": "s", "action": "pause"},
++        {"session_id": "s", "pause_after_chunks": 0},
++        {"session_id": "s", "action": "fork"},
++        {"session_id": "s", "action": "rewind"},
++        {"session_id": "s", "action": "resume", "replace": True},
++        {"session_id": "s", "tensor": torch.zeros(1)},
++        "s1",
++    ):
++        with pytest.raises(ValueError):
++            seam.validate_causal_kv_session(bad)
++
++
++class _FakeRun:
++    def __init__(self):
++        self.events = []
++
++    def stream_of(self, kv_cache):
++        return "uncond" if kv_cache == "neg" else "cond"
++
++    def capture_layer(self, capture, layer_index, key, value, freqs_cis):
++        self.events.append(("layer", capture.stream, layer_index))
++
++    def end_clean_forward(self, capture):
++        self.events.append(("end", capture.stream, capture.chunk.index))
++
++
++def test_capture_scope_is_disabled_by_default_and_not_reentrant():
++    assert seam.active_causal_kv_capture() is None
++    run = _FakeRun()
++    chunk = seam.CausalKVChunk(0, 0, 8, 0, 7040, 0, False, 0)
++    with seam.causal_kv_capture_scope(run, chunk, "neg") as scope:
++        assert seam.active_causal_kv_capture() is scope
++        scope.capture_layer(0, torch.zeros(1), torch.zeros(1), (None, None))
++        with pytest.raises(RuntimeError):
++            with seam.causal_kv_capture_scope(run, chunk, "pos"):
++                pass
++        with pytest.raises(RuntimeError):
++            scope.capture_layer(None, torch.zeros(1), torch.zeros(1), (None, None))
++    assert seam.active_causal_kv_capture() is None
++    assert run.events == [("layer", "uncond", 0), ("end", "uncond", 0)]
++    with pytest.raises(KeyError):
++        with seam.causal_kv_capture_scope(run, chunk, "pos"):
++            raise KeyError("forward failed")
++    assert seam.active_causal_kv_capture() is None
++    assert run.events[-1] == ("end", "uncond", 0)  # a failed forward is never reported complete
++
++
++def test_reelcache_args_defaults_and_validation(tmp_path):
++    args = ReelCacheArgs().validate()
++    assert not args.enabled and args.config == {} and args.hevc_inter_prediction is False
++    with pytest.raises(ValueError):
++        ReelCacheArgs(config={"representation": "raw"}).validate()
++    path = tmp_path / "reelcache.json"
++    path.write_text('{"representation": "raw"}')
++    loaded = ReelCacheArgs.from_dict(
++        {"reelcache_enable": True, "reelcache_config_json": str(path), "reelcache_hevc_inter_prediction": True}
++    )
++    assert loaded.backend_config() == {"representation": "raw", "hevc_inter_prediction": True}
++    with pytest.raises(ValueError):
++        ReelCacheArgs(enabled=True, config={"hevc_inter_prediction": True}).validate()
++
++
++def test_attach_backend_disabled_returns_none():
++    pipeline = SimpleNamespace(stages=[])
++    assert seam.attach_causal_kv_backend(pipeline, SimpleNamespace(reelcache_config=ReelCacheArgs())) is None
++    assert seam.attach_causal_kv_backend(pipeline, SimpleNamespace()) is None
++
++
++_BLOCK_REELCACHE = """
++import importlib.abc, sys
++class _Block(importlib.abc.MetaPathFinder):
++    def find_spec(self, name, path=None, target=None):
++        if name.split(".")[0] in ("reelcache", "reelcache_sglang_models"):
++            raise ImportError("reelcache is blocked in this test")
++        return None
++sys.meta_path.insert(0, _Block())
++"""
++
++
++def _run(script):
++    env = os.environ.copy()
++    env.pop("SGLANG_EXTERNAL_MODEL_PACKAGE", None)
++    completed = subprocess.run(
++        [sys.executable, "-c", _BLOCK_REELCACHE + script],
++        capture_output=True,
++        text=True,
++        timeout=600,
++        check=False,
++        env=env,
++    )
++    return completed
++
++
++def test_disabled_path_imports_nothing_from_reelcache():
++    completed = _run(
++        """
++from types import SimpleNamespace
++import sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising
++import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.longlive2
++import sglang.multimodal_gen.runtime.models.dits.causal_wanvideo
++import sglang.multimodal_gen.runtime.models.dits.longlive2
++from sglang.multimodal_gen.configs.reelcache import ReelCacheArgs
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import attach_causal_kv_backend
++assert attach_causal_kv_backend(SimpleNamespace(stages=[]), SimpleNamespace(reelcache_config=ReelCacheArgs())) is None
++assert not [name for name in sys.modules if name.split(".")[0] in ("reelcache", "reelcache_sglang_models")], sorted(sys.modules)
++print("ok")
++"""
++    )
++    assert completed.returncode == 0, completed.stdout + completed.stderr
++    assert "ok" in completed.stdout
++
++
++def test_enabled_without_reelcache_fails_explicitly():
++    completed = _run(
++        """
++from types import SimpleNamespace
++from sglang.multimodal_gen.configs.reelcache import ReelCacheArgs, ReelCacheUnavailableError
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import attach_causal_kv_backend
++args = ReelCacheArgs(enabled=True).validate()
++try:
++    args.require_available()
++except ReelCacheUnavailableError as exc:
++    print("startup-check:", exc)
++else:
++    raise SystemExit("require_available did not fail")
++class Stage:
++    def set_causal_kv_backend(self, backend):
++        raise SystemExit("backend attached")
++try:
++    attach_causal_kv_backend(SimpleNamespace(stages=[Stage()]), SimpleNamespace(reelcache_config=args))
++except ReelCacheUnavailableError as exc:
++    print("worker-check:", exc)
++else:
++    raise SystemExit("attach did not fail")
++"""
++    )
++    assert completed.returncode == 0, completed.stdout + completed.stderr
++    assert "startup-check:" in completed.stdout and "worker-check:" in completed.stdout
+-- 
+2.47.1
+

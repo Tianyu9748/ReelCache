@@ -1,0 +1,1173 @@
+From 7b818446301b6aec7f4818e2cb86b980421914dc Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 00:53:13 -0400
+Subject: [PATCH 11/26] [Diffusion] Causal KV sessions: controls through the
+ scheduler and HTTP (--reelcache-enable)
+
+Session controls for the optional causal KV archive backend (ReelCache), Step 14:
+
+* CausalKVSessionControlReq(op, args): plain-JSON controls dispatched by the
+  scheduler to the GPU worker's backend (backend.control); typed backend
+  errors become replies with code/status/message.
+* In-flight controls: the backend calls a boundary hook at every clean chunk
+  boundary of a session request; the scheduler polls its socket there (same
+  thread), answers read-only controls at once, flags a pause of the running
+  session and queues the pause first so it replies once durable; everything
+  else is queued in arrival order.
+* HTTP endpoints /v1/sessions..., /v1/session_capabilities,
+  /v1/session_requests/{id}, /v1/session_gc, registered only with
+  --reelcache-enable (the disabled server never imports the module).
+* /v1/videos forwards causal_kv_session only with --reelcache-enable (400
+  otherwise) and refuses client-selected paths on session requests; the
+  causal stage rejects a session handle without a backend and never opens a
+  run for warm-up copies.
+* Session requests are never merged by dynamic batching.
+* A request that restored history decodes only its new chunks by default
+  (causal_kv_session.output "new"/"full", decode_context_latents warm the
+  causal VAE decoder; the backend's decode plan in batch.extra["causal_kv"]).
+* Seam additions: CausalKVRequest.dispatched_at (worker clock, first-new-chunk
+  accounting), optional run.begin_clean_forward, observed plain requests for
+  backends that set observes_plain_requests (timing only).
+
+Disabled path unchanged: no backend, no hook, no router, no extra decode work.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../runtime/entrypoints/control_requests.py   |   9 +
+ .../runtime/entrypoints/http_server.py        |   9 +
+ .../openai/causal_kv_session_api.py           | 166 +++++++
+ .../runtime/entrypoints/openai/video_api.py   |  32 ++
+ .../layers/kvcache/causal_kv_backend.py       |  48 +-
+ .../runtime/managers/gpu_worker.py            |  48 ++
+ .../runtime/managers/scheduler.py             |  63 +++
+ .../pipelines_core/stages/causal_denoising.py |  40 +-
+ .../runtime/pipelines_core/stages/decoding.py |  34 +-
+ .../unit/test_causal_kv_session_controls.py   | 425 ++++++++++++++++++
+ 10 files changed, 860 insertions(+), 14 deletions(-)
+ create mode 100644 python/sglang/multimodal_gen/runtime/entrypoints/openai/causal_kv_session_api.py
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/control_requests.py b/python/sglang/multimodal_gen/runtime/entrypoints/control_requests.py
+index 9f142e7cd4..c86cae36d2 100644
+--- a/python/sglang/multimodal_gen/runtime/entrypoints/control_requests.py
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/control_requests.py
+@@ -44,6 +44,15 @@ class ReleaseRealtimeSessionReq(msgspec.Struct):
+     session_id: str
+ 
+ 
++class CausalKVSessionControlReq(msgspec.Struct):
++    """A causal KV session control (``--reelcache-enable``): ``op`` and plain-JSON
++    ``args`` for the worker's backend (``backend.control(op, args)``); never a
++    path. Routed to one replica (ReelCache sessions require a single replica)."""
++
++    op: str
++    args: dict = {}
++
++
+ class GetDisaggStatsReq(msgspec.Struct):
+     """Request to get disagg pipeline metrics from the scheduler."""
+ 
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/http_server.py b/python/sglang/multimodal_gen/runtime/entrypoints/http_server.py
+index d7ea394227..23af95b6f8 100644
+--- a/python/sglang/multimodal_gen/runtime/entrypoints/http_server.py
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/http_server.py
+@@ -458,6 +458,15 @@ def create_app(server_args: ServerArgs):
+     app.include_router(mesh_api.router)
+     app.include_router(weights_api.router)
+     app.include_router(rollout_api.router)
++    reelcache = getattr(server_args, "reelcache_config", None)
++    if reelcache is not None and reelcache.enabled:
++        # Causal KV session controls exist only with --reelcache-enable (imported here:
++        # the disabled server never loads the module).
++        from sglang.multimodal_gen.runtime.entrypoints.openai import (
++            causal_kv_session_api,
++        )
++
++        app.include_router(causal_kv_session_api.router)
+ 
+     app.state.server_args = server_args
+     app.state.prompt_enhancer = None
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/openai/causal_kv_session_api.py b/python/sglang/multimodal_gen/runtime/entrypoints/openai/causal_kv_session_api.py
+new file mode 100644
+index 0000000000..7f6da71fcf
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/openai/causal_kv_session_api.py
+@@ -0,0 +1,166 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Causal KV session controls over HTTP (registered only with ``--reelcache-enable``).
++
++Generation actions (generate, resume, fork, rewind, a native prompt change)
++are ordinary ``POST /v1/videos`` jobs carrying a ``causal_kv_session`` handle;
++the endpoints here control sessions without generating. Each one sends a
++``CausalKVSessionControlReq(op, args)`` to the scheduler; the worker's backend
++(``backend.control``) answers with plain JSON or a typed error
++(``{"code", "status", "message"}``, returned as that HTTP status). While a
++request runs, ``list``/``describe``/``request`` and the pause of the running
++session are answered at its next chunk boundary (a pause replies once it is
++durable); every other control waits for the running request. No endpoint
++accepts a filesystem path.
++
++=======================================================  =====================
++``GET    /v1/sessions``                                  list
++``GET    /v1/sessions/{session_id}?history=50``          describe
++``DELETE /v1/sessions/{session_id}?gc=true``             delete (+ GC)
++``GET    /v1/sessions/{session_id}/checkpoints``         checkpoints
++``POST   /v1/sessions/{session_id}/checkpoints``         checkpoint [name]
++``DELETE /v1/sessions/{session_id}/checkpoints/{name}``  delete a checkpoint
++``POST   /v1/sessions/{session_id}/open``                open (prepare)
++``POST   /v1/sessions/{session_id}/pause``               pause
++``POST   /v1/sessions/{session_id}/fork``                fork (no generation)
++``POST   /v1/sessions/{session_id}/rewind``              rewind (no generation)
++``POST   /v1/sessions/{session_id}/close``               close (drain | abort)
++``GET    /v1/session_capabilities``                      capabilities
++``GET    /v1/session_requests/{request_id}``             request summary
++``POST   /v1/session_gc``                                garbage collection
++=======================================================  =====================
++"""
++
++from typing import Any, Literal, Optional, Union
++
++from fastapi import APIRouter, HTTPException, Query
++from pydantic import BaseModel, ConfigDict
++
++from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
++    CausalKVSessionControlReq,
++)
++from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
++from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
++
++router = APIRouter(prefix="/v1", tags=["causal_kv_sessions"])
++
++
++class CheckpointBody(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++    name: Optional[str] = None
++    replace: bool = False
++
++
++class ForkBody(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++    target: str
++    checkpoint: Optional[Union[int, str]] = None
++
++
++class RewindBody(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++    checkpoint: Union[int, str]
++
++
++class CloseBody(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++    mode: Literal["drain", "abort"] = "drain"
++
++
++async def _control(op: str, **args: Any) -> dict:
++    """Send one control to the scheduler; typed errors become their HTTP status."""
++    args = {key: value for key, value in args.items() if value is not None}
++    try:
++        output = await async_scheduler_client.forward(
++            CausalKVSessionControlReq(op=op, args=args)
++        )
++    except TimeoutError as exc:
++        raise HTTPException(status_code=504, detail=str(exc)) from exc
++    if not isinstance(output, OutputBatch):
++        raise HTTPException(
++            status_code=500, detail=f"unexpected reply {type(output).__name__}"
++        )
++    result = output.output if isinstance(output.output, dict) else {}
++    if output.error is not None:
++        error = result.get("error") or {
++            "code": "internal",
++            "status": 500,
++            "message": output.error,
++        }
++        raise HTTPException(status_code=int(error.get("status", 500)), detail=error)
++    return result
++
++
++@router.get("/sessions")
++async def list_sessions():
++    return await _control("list")
++
++
++@router.get("/session_capabilities")
++async def session_capabilities():
++    return await _control("capabilities")
++
++
++@router.get("/session_requests/{request_id}")
++async def session_request(request_id: str):
++    return await _control("request", request_id=request_id)
++
++
++@router.post("/session_gc")
++async def session_gc():
++    return await _control("gc")
++
++
++@router.get("/sessions/{session_id}")
++async def describe_session(session_id: str, history: int = Query(50, ge=0)):
++    return await _control("describe", session_id=session_id, history=history)
++
++
++@router.delete("/sessions/{session_id}")
++async def delete_session(session_id: str, gc: bool = True):
++    return await _control("delete", session_id=session_id, gc=gc)
++
++
++@router.get("/sessions/{session_id}/checkpoints")
++async def session_checkpoints(session_id: str):
++    return await _control("checkpoints", session_id=session_id)
++
++
++@router.post("/sessions/{session_id}/checkpoints")
++async def create_checkpoint(session_id: str, body: Optional[CheckpointBody] = None):
++    body = body or CheckpointBody()
++    return await _control(
++        "checkpoint", session_id=session_id, name=body.name, replace=body.replace
++    )
++
++
++@router.delete("/sessions/{session_id}/checkpoints/{name}")
++async def delete_checkpoint(session_id: str, name: str, gc: bool = True):
++    return await _control("delete", session_id=session_id, checkpoint=name, gc=gc)
++
++
++@router.post("/sessions/{session_id}/open")
++async def open_session(session_id: str):
++    return await _control("open", session_id=session_id)
++
++
++@router.post("/sessions/{session_id}/pause")
++async def pause_session(session_id: str):
++    return await _control("pause", session_id=session_id)
++
++
++@router.post("/sessions/{session_id}/fork")
++async def fork_session(session_id: str, body: ForkBody):
++    return await _control(
++        "fork", session_id=session_id, target=body.target, checkpoint=body.checkpoint
++    )
++
++
++@router.post("/sessions/{session_id}/rewind")
++async def rewind_session(session_id: str, body: RewindBody):
++    return await _control("rewind", session_id=session_id, checkpoint=body.checkpoint)
++
++
++@router.post("/sessions/{session_id}/close")
++async def close_session(session_id: str, body: Optional[CloseBody] = None):
++    body = body or CloseBody()
++    return await _control("close", session_id=session_id, mode=body.mode)
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py b/python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py
+index a4380e1606..92b9eb8df6 100644
+--- a/python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py
+@@ -107,6 +107,28 @@ def _request_value(request: VideoGenerationsRequest, name: str) -> Any:
+     return _extra_value(request, name)
+ 
+ 
++def _check_causal_kv_session_request(
++    request: VideoGenerationsRequest, server_args: Any
++) -> None:
++    """``causal_kv_session`` (ReelCache sessions) needs ``--reelcache-enable`` and never
++    comes with client-selected filesystem paths."""
++    if _extra_value(request, "causal_kv_session") is None:
++        return
++    reelcache = getattr(server_args, "reelcache_config", None)
++    if reelcache is None or not reelcache.enabled:
++        raise HTTPException(
++            status_code=400,
++            detail="causal_kv_session requires a server started with --reelcache-enable",
++        )
++    for name in ("output_path", "perf_dump_path"):
++        if getattr(request, name, None):
++            raise HTTPException(
++                status_code=400,
++                detail=f"{name} is not accepted with causal_kv_session "
++                "(session requests never take client-selected paths)",
++            )
++
++
+ def _video_request_model_kwargs(
+     request: VideoGenerationsRequest,
+     sampling_params_cls: type[SamplingParams],
+@@ -317,6 +339,9 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
+         "diffusers_kwargs": request.diffusers_kwargs,
+         **_video_request_model_kwargs(request, sampling_params_cls),
+     }
++    session = _extra_value(request, "causal_kv_session")
++    if session is not None:  # checked by _check_causal_kv_session_request
++        kwargs["causal_kv_session"] = session
+ 
+     kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
+     sampling_params = build_sampling_params(request_id, **kwargs)
+@@ -706,6 +731,13 @@ async def create_video(
+         except Exception as e:
+             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+ 
++    try:
++        _check_causal_kv_session_request(req, server_args)
++    except HTTPException:
++        for td in temp_dirs:
++            shutil.rmtree(td, ignore_errors=True)
++        raise
++
+     # Resolve per-request output_path override
+     effective_output_path = req.output_path or server_args.output_path
+     if effective_output_path is None:
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+index c7c6c15fad..493cc03211 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+@@ -19,7 +19,9 @@ created once per GPU worker by :func:`attach_causal_kv_backend` and receives:
+   never the protected sink) are archived, as a new cache epoch
+   (``end_recache``);
+ * chunk-boundary callbacks (``end_chunk``) that can request a pause at the
+-  clean boundary;
++  clean boundary; before deciding, a backend may call the worker's boundary
++  hook (``set_boundary_hook``), where the scheduler applies in-flight session
++  controls (e.g. a pause of the running session);
+ * a restore target (:class:`CausalKVRestoreTarget`) through which restored
+   history is installed into ``CausalSelfAttentionKVCache`` slots with
+   ``install_restored_history`` and re-rotated with the engine's own RoPE.
+@@ -33,6 +35,14 @@ and only resets their cursors, so a backend that recorded
+ ``mutation_generation`` shows that nothing wrote the K/V since (any other
+ request, restore or growth renews it).
+ 
++Session controls (pause, checkpoint, fork, rewind, close, delete, list,
++describe; ``CausalKVSessionControlReq``) reach the backend through
++``control(op, args)`` between requests and ``inflight_control(op, args)``
++from the boundary hook while a request runs; both take and return plain JSON.
++A backend that sets ``observes_plain_requests`` also receives requests without
++a session handle (``CausalKVRequest.session`` is None) and may time their clean
++forwards (``begin_clean_forward`` / ``end_clean_forward``) without capturing.
++
+ Everything crossing this seam is plain data or a live tensor owned by the
+ worker; nothing here is serialized into requests.
+ """
+@@ -56,7 +66,13 @@ _SESSION_KEYS = {
+     "checkpoint",
+     "replace",
+     "durable",
++    "output",
++    "decode_context_latents",
+ }
++# ``output`` of a request that restored history: ``new`` decodes only its new
++# chunks (after ``decode_context_latents`` preceding latent frames that warm
++# the causal VAE decoder; their frames are dropped), ``full`` the whole clip.
++SESSION_OUTPUTS = ("new", "full")
+ 
+ 
+ def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
+@@ -69,7 +85,11 @@ def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
+     (fork source), ``checkpoint`` (node reference or chunk count),
+     ``replace`` (bool, ``generate`` only) and ``durable`` (bool: whether the
+     request returns only once its chunks are archived; the backend's default
+-    applies when absent). Live objects are rejected.
++    applies when absent), ``output`` (``new``: a request that restored history
++    returns only its new chunks, the default; ``full``: the whole clip) and
++    ``decode_context_latents`` (int >= 1: latent frames decoded before the new
++    chunks to warm the causal VAE decoder; the backend's default applies when
++    absent). Live objects are rejected.
+     """
+     if value is None:
+         return None
+@@ -105,12 +125,20 @@ def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
+     durable = value.get("durable")
+     if durable is not None and type(durable) is not bool:
+         raise ValueError("causal_kv_session.durable must be a bool")
++    output = value.get("output")
++    if output is not None and output not in SESSION_OUTPUTS:
++        raise ValueError(f"causal_kv_session.output must be one of {SESSION_OUTPUTS}")
++    context = value.get("decode_context_latents")
++    if context is not None and (type(context) is not int or context < 1):
++        raise ValueError("causal_kv_session.decode_context_latents must be a positive int")
+     result = {"session_id": session_id, "action": action, "replace": replace}
+     for name, item in (
+         ("pause_after_chunks", pause),
+         ("from_session", source),
+         ("checkpoint", checkpoint),
+         ("durable", durable),
++        ("output", output),
++        ("decode_context_latents", context),
+     ):
+         if item is not None:
+             result[name] = item
+@@ -166,7 +194,7 @@ class CausalKVRequest:
+     """Plain description of a request handed to ``CausalKVBackend.begin_request``."""
+ 
+     request_id: str | None
+-    session: dict[str, Any]  # validated causal_kv_session handle
++    session: dict[str, Any] | None  # validated causal_kv_session handle (None: an observed plain request)
+     conditioning: dict[str, Any]  # JSON identity of prompt/seed/sampling/geometry
+     block_sizes: tuple[int, ...]  # latent frames per causal block
+     tokens_per_frame: int
+@@ -182,6 +210,8 @@ class CausalKVRequest:
+     # prompts): one opaque string per block, compared by the backend over restored blocks only. Stages that
+     # provide it leave the timeline fields out of ``conditioning``. None: ``conditioning`` covers every block.
+     block_conditioning: tuple[str, ...] | None = None
++    # ``time.perf_counter()`` of the worker when it dispatched the request (first-new-chunk accounting).
++    dispatched_at: float | None = None
+ 
+ 
+ @dataclass(slots=True)
+@@ -224,7 +254,14 @@ class CausalKVRun(Protocol):
+ 
+ 
+ class CausalKVBackend(Protocol):
+-    """Worker-owned archive backend (e.g. ReelCache's CausalWanKVBridge)."""
++    """Worker-owned archive backend (e.g. ReelCache's CausalWanKVBridge).
++
++    Optional members (feature-detected): ``set_boundary_hook(hook)``,
++    ``control(op, args) -> dict``, ``inflight_control(op, args) -> dict | None``
++    (session controls; failures raise exceptions with ``code``, ``status`` and
++    ``to_dict()``), ``observes_plain_requests`` (bool) and the run's
++    ``begin_clean_forward(capture)``.
++    """
+ 
+     def begin_request(self, request: CausalKVRequest) -> CausalKVRun | None: ...
+ 
+@@ -277,6 +314,9 @@ def causal_kv_capture_scope(
+     else:
+         capture = CausalKVCapture(target, run.stream_of(kv_cache))
+     scope = _CaptureScope(run, capture)
++    begin = getattr(run, "begin_clean_forward", None)
++    if begin is not None:
++        begin(capture)
+     _ACTIVE_CAPTURE = scope
+     try:
+         yield scope
+diff --git a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+index 3c4d588276..b71c21305a 100644
+--- a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
++++ b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+@@ -283,6 +283,51 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
+         self._update_lora_metrics()
+ 
++    # --- causal KV session controls (--reelcache-enable) -------------------------------
++
++    def _causal_kv_control_call(self, method: str, op: str, args: dict) -> Any:
++        backend = self.causal_kv_backend
++        control = None if backend is None else getattr(backend, method, None)
++        if control is None:
++            return OutputBatch(
++                error="session controls require a server started with --reelcache-enable",
++                output={
++                    "error": {
++                        "code": "unsupported",
++                        "status": 404,
++                        "message": "session controls require --reelcache-enable",
++                    }
++                },
++            )
++        try:
++            return control(op, args)
++        except Exception as exc:  # noqa: BLE001 - typed control errors become replies
++            to_dict = getattr(exc, "to_dict", None)
++            error = (
++                to_dict()
++                if callable(to_dict)
++                else {"code": "internal", "status": 500, "message": repr(exc)}
++            )
++            return OutputBatch(error=error.get("message", repr(exc)), output={"error": error})
++
++    def causal_kv_session_control(self, op: str, args: dict) -> OutputBatch:
++        """A session control between requests (``CausalKVSessionControlReq``)."""
++        result = self._causal_kv_control_call("control", op, args)
++        return result if isinstance(result, OutputBatch) else OutputBatch(output=result)
++
++    def causal_kv_session_inflight(self, op: str, args: dict) -> OutputBatch | None:
++        """A session control received while a request runs (scheduler boundary poll).
++
++        None: run it after the running request (it may block or change the
++        running session); else the reply now (``output["deferred"]`` set:
++        reply after the running request, once the pause is durable)."""
++        if getattr(self.causal_kv_backend, "inflight_control", None) is None:
++            return None
++        result = self._causal_kv_control_call("inflight_control", op, args)
++        if result is None or isinstance(result, OutputBatch):
++            return result
++        return OutputBatch(output=result)
++
+     def release_realtime_session(self, session_id: str) -> OutputBatch:
+         """release the session of a realtime connection"""
+         if not session_id:
+@@ -540,6 +585,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+         req = batch[0]
+         if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
+             self._fit_auto_residency_probe(req)
++        if self.causal_kv_backend is not None:
++            # first-new-chunk accounting of session requests (worker clock)
++            req.extra["causal_kv_dispatched_at"] = time.perf_counter()
+         return self._execute_forward_common(
+             req,
+             forward_fn=lambda: self.pipeline.forward(req, self.server_args),
+diff --git a/python/sglang/multimodal_gen/runtime/managers/scheduler.py b/python/sglang/multimodal_gen/runtime/managers/scheduler.py
+index f2eb77b07c..82984853e8 100644
+--- a/python/sglang/multimodal_gen/runtime/managers/scheduler.py
++++ b/python/sglang/multimodal_gen/runtime/managers/scheduler.py
+@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+ )
+ from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
+ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
++    CausalKVSessionControlReq,
+     GetDisaggStatsReq,
+     ListLorasReq,
+     MergeLoraWeightsReq,
+@@ -156,6 +157,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
+             ListLorasReq: self._handle_list_loras,
+             ShutdownReq: self._handle_shutdown,
+             ReleaseRealtimeSessionReq: self._handle_release_realtime_session,
++            CausalKVSessionControlReq: self._handle_causal_kv_session_control,
+             GetDisaggStatsReq: self._handle_get_disagg_stats,
+             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+             UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
+@@ -191,6 +193,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
+ 
+         self._init_disagg_state(server_args, local_rank)
+ 
++        # --reelcache-enable: in-flight session controls (e.g. pausing the running
++        # session) are polled at the chunk boundaries of session requests.
++        backend = getattr(worker, "causal_kv_backend", None)
++        set_hook = getattr(backend, "set_boundary_hook", None)
++        if callable(set_hook):
++            set_hook(self._poll_causal_kv_controls)
++
+         if self._batch_metrics_enabled:
+             logger.info(
+                 "Dynamic batch metrics enabled; logging summary every %d dispatches.",
+@@ -242,6 +251,46 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
+         req = reqs[0]
+         return self.worker.release_realtime_session(req.session_id)
+ 
++    def _handle_causal_kv_session_control(self, reqs: List[Any]) -> OutputBatch:
++        req = reqs[0]
++        return self.worker.causal_kv_session_control(req.op, dict(req.args or {}))
++
++    def _poll_causal_kv_controls(self) -> None:
++        """Chunk-boundary poll inside a running session request (same thread as
++        the event loop, so the socket is never shared across threads).
++
++        Every received request is consumed like the event loop's step 1:
++        session controls the backend can serve now are answered at once (a
++        pause of the running session is flagged, and its reply is deferred:
++        the control is queued first, so it runs right after this request and
++        replies once the pause is durable); everything else is queued in
++        arrival order. All ranks poll at the same boundary (``recv_reqs``
++        broadcasts are collective)."""
++        new_reqs = self.recv_reqs()
++        new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
++        now = time.monotonic()
++        deferred = []
++        for identity, req in new_reqs:
++            if isinstance(req, CausalKVSessionControlReq):
++                reply = self.worker.causal_kv_session_inflight(
++                    req.op, dict(req.args or {})
++                )
++                if reply is not None:
++                    output = reply.output if isinstance(reply.output, dict) else {}
++                    if reply.error is None and output.get("deferred"):
++                        deferred.append((identity, req, now))
++                    else:
++                        self.return_result(reply, identity)
++                    continue
++            self.waiting_queue.append((identity, req, now))
++            if self.metrics is not None:
++                generation_req = get_first_generation_req(req)
++                if generation_req is not None:
++                    self.metrics.enqueue(
++                        id(req), is_warmup=generation_req.is_warmup, now=now
++                    )
++        self.waiting_queue.extendleft(reversed(deferred))
++
+     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+         """Handle update_weights_from_disk request for RL workflows."""
+         if self.worker.is_sleeping():
+@@ -581,6 +630,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
+             candidate_req
+         ):
+             return "realtime_session"
++        if self._has_causal_kv_session(base_req) or self._has_causal_kv_session(
++            candidate_req
++        ):
++            return "causal_kv_session"
+         if not isinstance(base_req.prompt, str) or not isinstance(
+             candidate_req.prompt, str
+         ):
+@@ -607,6 +660,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
+     def _has_realtime_session(req: Req) -> bool:
+         return bool(req.realtime_session_id) or req.session is not None
+ 
++    @staticmethod
++    def _has_causal_kv_session(req: Req) -> bool:
++        # Session requests run one sample each (worker-owned session state).
++        return getattr(req, "causal_kv_session", None) is not None
++
+     def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
+         pipeline_config = self.server_args.pipeline_config
+         return (
+@@ -641,6 +699,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
+         ):
+             return False
+ 
++        if self._has_causal_kv_session(base_req) or self._has_causal_kv_session(
++            candidate_req
++        ):
++            return False
++
+         if not isinstance(base_req.prompt, str) or not isinstance(
+             candidate_req.prompt, str
+         ):
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+index 5dfea8a92b..61f22e2686 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+@@ -356,22 +356,41 @@ class CausalDMDDenoisingStage(DenoisingStage):
+         """
+         backend = self._causal_kv_backend
+         if backend is None:
++            if getattr(batch, "causal_kv_session", None) is not None:
++                raise ValueError(
++                    "causal_kv_session requires a server started with --reelcache-enable"
++                )
+             return None, 0
++        if getattr(batch, "is_warmup", False):
++            return None, 0  # warm-up copies of requests never touch sessions
+         session = validate_causal_kv_session(getattr(batch, "causal_kv_session", None))
+         if session is None:
+-            return None, 0
+-        if latents.shape[0] != 1:
+-            raise ValueError("causal KV sessions support one sample per request")
+-        if getattr(batch, "image_latent", None) is not None:
+-            raise NotImplementedError(
+-                "causal KV sessions do not support image-conditioned warm-up yet"
+-            )
+-        if self._causal_sequence_shard_enabled(batch):
+-            raise NotImplementedError("causal KV sessions do not support sequence sharding")
++            # Optional observation of plain requests (timing only, nothing captured).
++            if not getattr(backend, "observes_plain_requests", False):
++                return None, 0
++            if (
++                latents.shape[0] != 1
++                or getattr(batch, "image_latent", None) is not None
++                or self._causal_sequence_shard_enabled(batch)
++            ):
++                return None, 0
++        else:
++            if latents.shape[0] != 1:
++                raise ValueError("causal KV sessions support one sample per request")
++            if getattr(batch, "image_latent", None) is not None:
++                raise NotImplementedError(
++                    "causal KV sessions do not support image-conditioned warm-up yet"
++                )
++            if self._causal_sequence_shard_enabled(batch):
++                raise NotImplementedError(
++                    "causal KV sessions do not support sequence sharding"
++                )
+         transformer = self.transformer
+         rope = getattr(transformer, "causal_rotary_cos_sin", None)
+         rotate_key = getattr(transformer, "causal_rotate_key", None)
+         if rope is None or rotate_key is None:
++            if session is None:
++                return None, 0
+             raise NotImplementedError(
+                 f"{type(transformer).__name__} exposes no causal RoPE for restored history"
+             )
+@@ -404,6 +423,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
+             block_conditioning=self._causal_kv_block_conditioning(
+                 batch, server_args, block_sizes
+             ),
++            dispatched_at=(getattr(batch, "extra", None) or {}).get(
++                "causal_kv_dispatched_at"
++            ),
+         )
+         run = backend.begin_request(request)
+         if run is None:
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
+index b0e5df668b..3469277e2e 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
+@@ -78,6 +78,35 @@ def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Te
+     return latents
+ 
+ 
++def _causal_kv_decode_window(batch: Req) -> tuple[torch.Tensor, int | None]:
++    """Latents to decode and how many trailing latent frames to keep.
++
++    A causal KV session request that restored history and asked for its new
++    chunks only (``--reelcache-enable``; the backend's ``decode`` plan in
++    ``batch.extra["causal_kv"]``) decodes from ``start_latent``: a few context
++    latents that warm the causal VAE decoder, then the new chunks. Otherwise
++    the whole ``batch.latents`` (``None``: keep every frame)."""
++    summary = batch.extra.get("causal_kv")
++    plan = summary.get("decode") if isinstance(summary, dict) else None
++    if not isinstance(plan, dict) or plan.get("output") != "new":
++        return batch.latents, None
++    start = int(plan["start_latent"])
++    latents = batch.latents[:, :, start:]
++    return latents, int(latents.shape[2]) - int(plan["context_latents"])
++
++
++def _keep_last_latent_frames(
++    frames: torch.Tensor, latents: torch.Tensor, keep: int
++) -> torch.Tensor:
++    """The frames of the last ``keep`` latent frames of a causal (Wan) VAE decode:
++    the first decoded latent yields one frame, each later one ``(F - 1) / (T - 1)``."""
++    total = int(latents.shape[2])
++    if keep >= total:
++        return frames
++    per_latent = (int(frames.shape[2]) - 1) // max(total - 1, 1)
++    return frames[:, :, -keep * per_latent :]
++
++
+ def _ensure_tensor_decode_output(decode_output):
+     """
+     Ensure VAE decode output is a tensor.
+@@ -338,7 +367,10 @@ class DecodingStage(PipelineStage):
+                 vae,
+                 quality_allows_kernel_fusions(batch.sampling_params.quality),
+             ):
+-                frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
++                latents, keep_latents = _causal_kv_decode_window(batch)
++                frames = self.decode(latents, server_args, vae_dtype=vae_dtype)
++                if keep_latents is not None:
++                    frames = _keep_last_latent_frames(frames, latents, keep_latents)
+ 
+                 # decode trajectory latents if needed
+                 if batch.return_trajectory_decoded:
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+new file mode 100644
+index 0000000000..ac3dc8202b
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+@@ -0,0 +1,425 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Causal KV session controls (``--reelcache-enable``) on the SGLang side, with fake backends (no ReelCache)."""
++
++import asyncio
++from collections import deque
++from types import SimpleNamespace
++
++import pytest
++import torch
++from fastapi import FastAPI, HTTPException
++from fastapi.testclient import TestClient
++
++from sglang.multimodal_gen.configs.reelcache import ReelCacheArgs
++from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
++    CausalKVSessionControlReq,
++)
++from sglang.multimodal_gen.runtime.entrypoints.openai import (
++    causal_kv_session_api as session_api,
++)
++from sglang.multimodal_gen.runtime.layers.kvcache import causal_kv_backend as seam
++from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
++from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
++from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
++from sglang.multimodal_gen.runtime.pipelines_core.stages import decoding
++from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
++    CAUSAL_BLOCK_PROMPTS_KEY,
++    CAUSAL_SCENE_CUT_MASK_KEY,
++    CAUSAL_SHOT_INDICES_KEY,
++    CausalDMDDenoisingStage,
++)
++from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.longlive2 import (
++    LongLive2CausalDenoisingStage,
++)
++
++
++def test_session_handle_output_fields():
++    handle = seam.validate_causal_kv_session(
++        {
++            "session_id": "s",
++            "action": "resume",
++            "output": "full",
++            "decode_context_latents": 4,
++        }
++    )
++    assert (handle["output"], handle["decode_context_latents"]) == ("full", 4)
++    assert "output" not in seam.validate_causal_kv_session({"session_id": "s"})
++    for bad in (
++        {"session_id": "s", "output": "all"},
++        {"session_id": "s", "decode_context_latents": 0},
++        {"session_id": "s", "decode_context_latents": 1.5},
++    ):
++        with pytest.raises(ValueError):
++            seam.validate_causal_kv_session(bad)
++
++
++class _Run:
++    def __init__(self):
++        self.events = []
++
++    def stream_of(self, kv_cache):
++        return "cond"
++
++    def begin_clean_forward(self, capture):
++        self.events.append(("begin", capture.chunk.index))
++
++    def capture_layer(self, capture, layer_index, key, value, freqs_cis):
++        self.events.append(("layer", layer_index))
++
++    def end_clean_forward(self, capture):
++        self.events.append(("end", capture.chunk.index))
++
++
++def test_capture_scope_announces_the_clean_forward_start():
++    run = _Run()
++    chunk = seam.CausalKVChunk(2, 6, 3, 0, 10, 6, False, 0)
++    with seam.causal_kv_capture_scope(run, chunk, "pos") as scope:
++        scope.capture_layer(0, torch.zeros(1), torch.zeros(1), (None, None))
++    assert run.events == [("begin", 2), ("layer", 0), ("end", 2)]
++
++
++class _Backend:
++    """A worker backend answering controls like ReelCache's bridge would."""
++
++    def __init__(self):
++        self.calls = []
++
++    def control(self, op, args):
++        self.calls.append(("control", op, args))
++        if args.get("session_id") == "missing":
++            error = RuntimeError("unknown causal KV session 'missing'")
++            error.to_dict = lambda: {
++                "code": "unknown_session",
++                "status": 404,
++                "message": str(error),
++            }
++            raise error
++        return {"op": op, **args}
++
++    def inflight_control(self, op, args):
++        self.calls.append(("inflight", op, args))
++        if op == "pause" and args.get("session_id") == "running":
++            return {"op": op, "status": "pause_requested", "deferred": True}
++        if op in ("describe", "list"):
++            return {"op": op, "status": "running"}
++        return None
++
++
++def _worker(backend):
++    worker = GPUWorker.__new__(GPUWorker)
++    worker.causal_kv_backend = backend
++    return worker
++
++
++def test_worker_maps_controls_and_typed_errors():
++    worker = _worker(_Backend())
++    ok = worker.causal_kv_session_control("describe", {"session_id": "s"})
++    assert ok.error is None and ok.output == {"op": "describe", "session_id": "s"}
++    failed = worker.causal_kv_session_control("describe", {"session_id": "missing"})
++    assert (
++        failed.output["error"]["code"] == "unknown_session"
++        and failed.output["error"]["status"] == 404
++    )
++    disabled = _worker(None).causal_kv_session_control("list", {})
++    assert disabled.error and disabled.output["error"]["code"] == "unsupported"
++    assert _worker(None).causal_kv_session_inflight("list", {}) is None
++    assert (
++        worker.causal_kv_session_inflight("checkpoint", {"session_id": "running"})
++        is None
++    )
++
++
++def _scheduler(worker, received):
++    scheduler = Scheduler.__new__(Scheduler)
++    scheduler.worker = worker
++    scheduler.metrics = None
++    scheduler.waiting_queue = deque([(b"earlier", "queued-before", 0.0)])
++    scheduler.replies = []
++    scheduler.recv_reqs = lambda: list(received)
++    scheduler.process_received_reqs_with_req_based_warmup = lambda reqs: reqs
++    scheduler.return_result = lambda output, identity, should_not_return=False: (
++        scheduler.replies.append((identity, output))
++    )
++    return scheduler
++
++
++def test_boundary_poll_defers_the_pause_and_serves_reads_in_flight():
++    backend = _Backend()
++    pause = CausalKVSessionControlReq(op="pause", args={"session_id": "running"})
++    describe = CausalKVSessionControlReq(op="describe", args={"session_id": "running"})
++    close = CausalKVSessionControlReq(op="close", args={"session_id": "running"})
++    generation = SimpleNamespace(is_warmup=False)
++    scheduler = _scheduler(
++        _worker(backend),
++        [(b"a", pause), (b"b", describe), (b"c", close), (b"d", generation)],
++    )
++    scheduler._poll_causal_kv_controls()
++    # The deferred pause runs first after the request (it then drains and replies durably).
++    assert [identity for identity, _, _ in scheduler.waiting_queue] == [
++        b"a",
++        b"earlier",
++        b"c",
++        b"d",
++    ]
++    assert [identity for identity, _ in scheduler.replies] == [b"b"]
++    assert scheduler.replies[0][1].output["status"] == "running"
++    handled = scheduler._handle_causal_kv_session_control([pause])
++    assert handled.output == {"op": "pause", "session_id": "running"}
++    assert Scheduler._has_causal_kv_session(
++        SimpleNamespace(causal_kv_session={"session_id": "s"})
++    )
++    assert not Scheduler._has_causal_kv_session(SimpleNamespace(causal_kv_session=None))
++
++
++def test_decode_window_keeps_only_the_new_chunks():
++    latents = torch.arange(9.0).view(1, 1, 9, 1, 1).expand(1, 2, 9, 2, 2)
++    plain = SimpleNamespace(extra={}, latents=latents)
++    assert decoding._causal_kv_decode_window(plain)[1] is None
++    full = SimpleNamespace(
++        extra={"causal_kv": {"decode": {"output": "full"}}}, latents=latents
++    )
++    assert decoding._causal_kv_decode_window(full)[0] is latents
++    plan = {
++        "output": "new",
++        "start_latent": 4,
++        "context_latents": 2,
++        "first_new_latent": 6,
++        "exact": False,
++    }
++    window, keep = decoding._causal_kv_decode_window(
++        SimpleNamespace(extra={"causal_kv": {"decode": plan}}, latents=latents)
++    )
++    assert window.shape[2] == 5 and keep == 3 and float(window[0, 0, 0, 0, 0]) == 4.0
++    frames = torch.arange(1 + 4 * 4.0).view(
++        1, 1, 17, 1, 1
++    )  # 5 latents: 1 + 4 x 4 frames
++    kept = decoding._keep_last_latent_frames(frames, window, keep)
++    assert kept.flatten().tolist() == list(
++        range(5, 17)
++    )  # the last 3 latents' 12 frames
++
++
++def test_video_api_session_requests_need_reelcache_and_take_no_paths():
++    from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
++        VideoGenerationsRequest,
++    )
++    from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
++        _check_causal_kv_session_request,
++    )
++
++    request = VideoGenerationsRequest(prompt="x", causal_kv_session={"session_id": "s"})
++    plain = VideoGenerationsRequest(prompt="x")
++    disabled = SimpleNamespace(reelcache_config=ReelCacheArgs())
++    enabled = SimpleNamespace(reelcache_config=ReelCacheArgs(enabled=True))
++    _check_causal_kv_session_request(plain, disabled)
++    with pytest.raises(HTTPException) as caught:
++        _check_causal_kv_session_request(request, disabled)
++    assert caught.value.status_code == 400 and "--reelcache-enable" in caught.value.detail
++    _check_causal_kv_session_request(request, enabled)
++    with_path = VideoGenerationsRequest(
++        prompt="x", causal_kv_session={"session_id": "s"}, output_path="/x"
++    )
++    with pytest.raises(HTTPException):
++        _check_causal_kv_session_request(with_path, enabled)
++
++
++def test_session_endpoints_map_typed_errors_to_http(monkeypatch):
++    sent = []
++
++    async def forward(req, timeout_ms=None):
++        sent.append(req)
++        if req.args.get("session_id") == "missing":
++            error = {"code": "unknown_session", "status": 404, "message": "unknown"}
++            return OutputBatch(error="unknown", output={"error": error})
++        if req.op == "close" and req.args.get("session_id") == "busy":
++            error = {"code": "busy", "status": 409, "message": "running"}
++            return OutputBatch(error="running", output={"error": error})
++        return OutputBatch(output={"op": req.op, **req.args})
++
++    monkeypatch.setattr(session_api.async_scheduler_client, "forward", forward)
++    app = FastAPI()
++    app.include_router(session_api.router)
++    client = TestClient(app)
++    assert client.get("/v1/sessions").json() == {"op": "list"}
++    assert client.get("/v1/sessions/s1?history=3").json() == {
++        "op": "describe",
++        "session_id": "s1",
++        "history": 3,
++    }
++    assert (
++        client.post("/v1/sessions/s1/checkpoints", json={"name": "c1"}).json()["name"]
++        == "c1"
++    )
++    assert (
++        client.post(
++            "/v1/sessions/s1/fork", json={"target": "f", "checkpoint": 2}
++        ).json()["checkpoint"]
++        == 2
++    )
++    assert (
++        client.post("/v1/sessions/s1/rewind", json={"checkpoint": "c1"}).json()["op"]
++        == "rewind"
++    )
++    assert (
++        client.post("/v1/sessions/s1/close", json={"mode": "abort"}).json()["mode"]
++        == "abort"
++    )
++    assert client.delete("/v1/sessions/s1/checkpoints/c1").json() == {
++        "op": "delete",
++        "session_id": "s1",
++        "checkpoint": "c1",
++        "gc": True,
++    }
++    assert client.get("/v1/session_requests/r1").json() == {
++        "op": "request",
++        "request_id": "r1",
++    }
++    assert client.post("/v1/session_gc").json() == {"op": "gc"}
++    missing = client.get("/v1/sessions/missing")
++    assert (
++        missing.status_code == 404
++        and missing.json()["detail"]["code"] == "unknown_session"
++    )
++    assert client.post("/v1/sessions/busy/close").status_code == 409
++    assert (
++        client.post(
++            "/v1/sessions/s1/fork", json={"target": "f", "path": "/x"}
++        ).status_code
++        == 422
++    )
++    assert (
++        client.post("/v1/sessions/s1/close", json={"mode": "explode"}).status_code
++        == 422
++    )
++    assert all(isinstance(req, CausalKVSessionControlReq) for req in sent)
++
++
++def _longlive2_batch(prompts, cuts, shots):
++    params = SimpleNamespace(
++        prompt="ignored", shot_prompts=["A", "B"], multi_shot_sink=True
++    )
++    return SimpleNamespace(
++        extra={
++            CAUSAL_BLOCK_PROMPTS_KEY: prompts,
++            CAUSAL_SCENE_CUT_MASK_KEY: cuts,
++            CAUSAL_SHOT_INDICES_KEY: shots,
++        },
++        multi_shot_sink=True,
++        sampling_params=params,
++    )
++
++
++def test_longlive2_multi_shot_blocks_carry_their_own_conditioning():
++    stage = LongLive2CausalDenoisingStage.__new__(LongLive2CausalDenoisingStage)
++    stage.sink_size = 1
++    first = _longlive2_batch(["A", "A", "A", "A"], [False] * 4, [0, 0, 0, 0])
++    switched = _longlive2_batch(
++        ["A", "A", "The scene transitions. B", "The scene transitions. B"],
++        [False, False, True, False],
++        [0, 0, 1, 1],
++    )
++    ids_first = stage._causal_kv_block_conditioning(first, None, [8] * 4)
++    ids_switched = stage._causal_kv_block_conditioning(switched, None, [8] * 4)
++    assert ids_first[:2] == ids_switched[:2] and ids_first[2:] != ids_switched[2:]
++    assert ids_switched[2].startswith("shot1:cut:") and ids_switched[3].startswith(
++        "shot1:cont:"
++    )
++    plain = SimpleNamespace(extra={}, sampling_params=None)
++    assert stage._causal_kv_block_conditioning(plain, None, [8] * 4) is None
++    with pytest.raises(ValueError):
++        stage._causal_kv_block_conditioning(first, None, [8] * 3)
++
++
++def test_stage_without_backend_rejects_session_requests_and_skips_warmups():
++    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
++    stage._causal_kv_backend = None
++    batch = SimpleNamespace(
++        causal_kv_session={"session_id": "s"}, is_warmup=False, extra={}
++    )
++    with pytest.raises(ValueError, match="--reelcache-enable"):
++        stage._begin_causal_kv_run(
++            batch,
++            None,
++            ctx=None,
++            block_sizes=[3],
++            pos_start_base=0,
++            use_cfg=False,
++            kv_cache=None,
++            kv_cache_neg=None,
++            latents=torch.zeros(1),
++        )
++    stage._causal_kv_backend = SimpleNamespace(
++        begin_request=lambda request: pytest.fail("warm-up reached")
++    )
++    warmup = SimpleNamespace(
++        causal_kv_session={"session_id": "s"}, is_warmup=True, extra={}
++    )
++    assert stage._begin_causal_kv_run(
++        warmup,
++        None,
++        ctx=None,
++        block_sizes=[3],
++        pos_start_base=0,
++        use_cfg=False,
++        kv_cache=None,
++        kv_cache_neg=None,
++        latents=torch.zeros(1),
++    ) == (None, 0)
++    plain = SimpleNamespace(causal_kv_session=None, is_warmup=False, extra={})
++    assert stage._begin_causal_kv_run(
++        plain,
++        None,
++        ctx=None,
++        block_sizes=[3],
++        pos_start_base=0,
++        use_cfg=False,
++        kv_cache=None,
++        kv_cache_neg=None,
++        latents=torch.zeros(1),
++    ) == (None, 0)
++
++
++def test_session_router_is_registered_only_with_reelcache():
++    from sglang.multimodal_gen.runtime.entrypoints import http_server
++
++    def collect(routes):
++        found = set()
++        for route in routes:
++            path = getattr(route, "path", None)
++            if path is not None:
++                found.add(path)
++            nested = (
++                getattr(route, "routes", None)
++                or getattr(getattr(route, "original_router", None), "routes", None)
++                or getattr(getattr(route, "router", None), "routes", None)
++            )
++            if nested:
++                found |= collect(nested)
++        return found
++
++    def paths(enabled):
++        server_args = SimpleNamespace(
++            enable_metrics=False,
++            reelcache_config=ReelCacheArgs(enabled=enabled),
++            pipeline_config=SimpleNamespace(
++                supports_action_endpoint=lambda: False,
++                supports_openpi_endpoint=lambda: False,
++            ),
++        )
++        return collect(http_server.create_app(server_args).routes)
++
++    assert "/v1/sessions/{session_id}/pause" in paths(True)
++    assert not [path for path in paths(False) if path.startswith("/v1/session")]
++
++
++def test_control_request_round_trips_as_plain_data():
++    import msgspec
++
++    req = CausalKVSessionControlReq(
++        op="fork", args={"session_id": "s", "target": "f", "checkpoint": 2}
++    )
++    decoded = msgspec.json.decode(
++        msgspec.json.encode(req), type=CausalKVSessionControlReq
++    )
++    assert decoded == req and CausalKVSessionControlReq(op="list").args == {}
++    asyncio.run(asyncio.sleep(0))
+-- 
+2.47.1
+

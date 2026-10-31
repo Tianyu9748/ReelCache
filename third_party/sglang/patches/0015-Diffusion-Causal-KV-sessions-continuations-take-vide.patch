@@ -1,0 +1,82 @@
+From da96228cb6ba5fb4feee96155d5258fcdbeedd00 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 03:12:19 -0400
+Subject: [PATCH 15/26] [Diffusion] Causal KV sessions: continuations take
+ video conditioning from the archive
+
+A request that resumes, forks or rewinds a causal KV session (--reelcache-enable)
+gets its conditioning from the session archive (e.g. the LongCat-Video session
+provider's boundary frames, which refuses client conditioning), so the
+'requires a video_path' check of video-conditioned tasks (F2V/V2V) does not
+apply to it. Task resolution is unchanged.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../configs/sample/sampling_params.py         | 13 ++++++++++-
+ .../unit/test_causal_kv_session_controls.py   | 22 +++++++++++++++++++
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/multimodal_gen/configs/sample/sampling_params.py b/python/sglang/multimodal_gen/configs/sample/sampling_params.py
+index 2e150c8992..40435c9e95 100644
+--- a/python/sglang/multimodal_gen/configs/sample/sampling_params.py
++++ b/python/sglang/multimodal_gen/configs/sample/sampling_params.py
+@@ -749,7 +749,11 @@ class SamplingParams:
+                     f"input_reference is not supported for {task_type.name} models."
+                 )
+ 
+-        if task_type.requires_video_input() and not self.video_path:
++        if (
++            task_type.requires_video_input()
++            and not self.video_path
++            and not self._conditioning_from_session()
++        ):
+             raise ValueError(f"Task {task_type.name} requires a 'video_path' input")
+         # Legacy pipelines retain their model-owned video conditioning checks.
+         # Explicit multi-task declarations use the standard per-task contract.
+@@ -766,6 +770,13 @@ class SamplingParams:
+         ):
+             raise ValueError(f"video_path is not supported for task {task_type.name}")
+ 
++    def _conditioning_from_session(self) -> bool:
++        """A causal KV session request continuing an archived session (resume, fork,
++        rewind; ``--reelcache-enable``): its conditioning comes from the session archive
++        (e.g. a session provider's boundary frames), never from the request."""
++        session = self.causal_kv_session
++        return isinstance(session, dict) and session.get("action", "generate") != "generate"
++
+     def resolve_task_type(self, pipeline_config) -> ModelTaskType:
+         resolver = getattr(pipeline_config, "resolve_task_type", None)
+         if resolver is None:
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+index 3d6edef339..43902749ca 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+@@ -539,3 +539,25 @@ def test_decoding_stage_decodes_inside_the_memory_critical_section(monkeypatch):
+         ("decode",),
+         ("exit", "vae_decode", "job-1"),
+     ]
++
++
++def test_session_continuations_take_their_video_conditioning_from_the_archive():
++    from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
++
++    config = SimpleNamespace(task_type="f2v")  # e.g. LongCat-Video continuation
++
++    def params(**extra):
++        return SamplingParams(prompt="p", num_frames=93, adjust_frames=False, **extra)
++
++    with pytest.raises(ValueError, match="requires a 'video_path'"):
++        params()._validate_with_pipeline_config(config)
++    with pytest.raises(ValueError, match="requires a 'video_path'"):
++        params(causal_kv_session={"session_id": "s"})._validate_with_pipeline_config(config)
++    for action, extra in (
++        ("resume", {}),
++        ("fork", {"from_session": "a"}),
++        ("rewind", {"checkpoint": 1}),
++    ):
++        handle = {"session_id": "s", "action": action, **extra}
++        # the session archive supplies the boundary conditioning
++        params(causal_kv_session=handle)._validate_with_pipeline_config(config)
+-- 
+2.47.1
+

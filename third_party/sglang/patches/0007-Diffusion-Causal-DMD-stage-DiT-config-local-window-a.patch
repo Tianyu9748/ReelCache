@@ -1,0 +1,245 @@
+From 5792036c7b175f4718d4b5613b4addf240b6d414 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:29:59 -0400
+Subject: [PATCH 07/26] [Diffusion] Causal DMD stage: DiT-config local window
+ and request-scoped cache geometry
+
+* local_attn_size is read from the DiT config. e00930c read
+  self.transformer.model.local_attn_size; the causal DiTs have no .model, so it
+  always fell back to -1 (the buffer was sized by sliding_window_num_frames
+  even for a configured local window). An explicit realtime KV-buffer override
+  (realtime_causal_kv_cache_num_frames) still wins. No shipped model changes
+  size: LongLive 2.0 has local_attn_size == sliding_window_num_frames == 32,
+  Wan/LingBot have -1.
+* Stage caches are reused across requests only when the request's geometry
+  matches (layers, global sink, sink tokens, buffer tokens at the request's
+  tokens per frame); the stock forward now uses _cache_needs_reinit_for_batch
+  like LongLive 2.0 instead of reusing the first request's caches whatever the
+  resolution. Same-geometry requests are reset exactly as before.
+* _causal_kv_cache_size_for_batch(batch) is the per-request sizing hook
+  (request-sized full-history caches for the CausVid/RAVEN profiles); it only
+  adds kv_cache_size to the init kwargs when it differs from the stage default.
+
+Tests: config window, realtime override precedence, reinit on resolution/sink/
+layer changes, request-sized override.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../pipelines_core/stages/causal_denoising.py | 54 +++++++++---
+ .../test/unit/test_causal_kv_cache_sizing.py  | 87 +++++++++++++++++++
+ 2 files changed, 129 insertions(+), 12 deletions(-)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_causal_kv_cache_sizing.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+index 8994c14ff0..5779e1bd3a 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+@@ -159,6 +159,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
+     # dense path unchanged; class defaults also cover stages built with __new__.
+     _causal_kv_backend: Any = None
+     _causal_kv_pending: tuple[Any, CausalKVChunk] | None = None
++    _causal_kv_cache_frames_override: int | None = None
+ 
+     def default_workload_iterations(
+         self, batch: Req, num_inference_steps: int
+@@ -184,12 +185,14 @@ class CausalDMDDenoisingStage(DenoisingStage):
+             self.transformer.config.sliding_window_num_frames
+         )
+ 
+-        try:
+-            self.local_attn_size = getattr(
+-                self.transformer.model, "local_attn_size", -1
+-            )  # type: ignore
+-        except Exception:
+-            self.local_attn_size = -1
++        # Temporal local-attention window (latent frames) of the DiT config; -1 = none.
++        # (e00930c read ``self.transformer.model.local_attn_size``: the causal DiTs have no
++        # ``.model``, so it always fell back to -1.)
++        self.local_attn_size = int(
++            getattr(self.transformer.config, "local_attn_size", -1)
++        )
++        # Explicit realtime KV-buffer override (frames); wins over the config window.
++        self._causal_kv_cache_frames_override: int | None = None
+         self.sink_size = self.transformer.config.sink_size
+ 
+         self._causal_attn_metadata_builder_cls = None
+@@ -628,6 +631,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
+             if kv_cache_num_frames <= 0:
+                 raise ValueError("realtime_causal_kv_cache_num_frames must be positive")
+             self.sliding_window_num_frames = int(kv_cache_num_frames)
++            self._causal_kv_cache_frames_override = int(kv_cache_num_frames)
+ 
+         if (
+             server_args.kv_cache_quant_config.enabled
+@@ -1226,22 +1230,45 @@ class CausalDMDDenoisingStage(DenoisingStage):
+     def _causal_kv_cache_global_sink_tokens_for_batch(self, batch: Req) -> int:
+         return 0
+ 
++    def _causal_kv_cache_size_for_batch(self, batch: Req) -> int:
++        """KV buffer tokens of this request's causal caches.
++
++        Default: the stage geometry (``_get_causal_kv_cache_size``) at the request's
++        tokens per frame. Stages with request-sized policies (e.g. a full-history
++        cache holding every frame of the request) override it.
++        """
++        return self._get_causal_kv_cache_size()
++
+     def _causal_kv_cache_kwargs_for_batch(
+         self,
+         batch: Req,
+     ) -> dict[str, Any] | None:
++        kwargs: dict[str, Any] = {}
+         global_sink_tokens = self._causal_kv_cache_global_sink_tokens_for_batch(batch)
+-        if global_sink_tokens <= 0:
+-            return None
+-        return {"global_sink_tokens": global_sink_tokens}
++        if global_sink_tokens > 0:
++            kwargs["global_sink_tokens"] = global_sink_tokens
++        cache_size = self._causal_kv_cache_size_for_batch(batch)
++        if cache_size != self._get_causal_kv_cache_size():
++            kwargs["kv_cache_size"] = cache_size
++        return kwargs or None
+ 
+     def _cache_needs_reinit_for_batch(self, kv_cache, batch: Req) -> bool:
++        """True when the stage caches cannot serve this request as they are.
++
++        Caches are reused (reset) across requests only when their geometry is the
++        request's: layer count, global sink, sink tokens and buffer size (which
++        depends on the request's tokens per frame and the stage policy).
++        """
+         if kv_cache is None or len(kv_cache) != self.num_transformer_blocks:
+             return True
+         expected_global_sink_tokens = (
+             self._causal_kv_cache_global_sink_tokens_for_batch(batch)
+         )
+-        return kv_cache[0].global_sink_tokens != expected_global_sink_tokens
++        return (
++            kv_cache[0].global_sink_tokens != expected_global_sink_tokens
++            or kv_cache[0].sink_tokens != self._get_causal_sink_tokens()
++            or kv_cache[0].cache_size != self._causal_kv_cache_size_for_batch(batch)
++        )
+ 
+     def _pin_current_chunk(self, kv_cache, current_num_frames: int) -> None:
+         if kv_cache is None:
+@@ -1315,6 +1342,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
+         *,
+         sequence_shard_enabled: bool = False,
+     ) -> int:
++        if self._causal_kv_cache_frames_override is not None:
++            return self._causal_kv_cache_frames_override * self.num_token_per_frame
+         if self.local_attn_size != -1:
+             return self.local_attn_size * self.num_token_per_frame
+         return self.num_token_per_frame * self.sliding_window_num_frames
+@@ -1382,13 +1411,14 @@ class CausalDMDDenoisingStage(DenoisingStage):
+         # TODO(will): make this a parameter once we add i2v support
+         independent_first_frame = self.transformer.independent_first_frame
+ 
+-        # Initialize or reset caches
+-        if self.causal_kv_cache is None:
++        # Initialize (first request, or a request whose cache geometry differs) or reset caches
++        if self._cache_needs_reinit_for_batch(self.causal_kv_cache, batch):
+             self._initialize_causal_caches(
+                 batch_size=latents.shape[0],
+                 max_text_len=self._get_max_text_len(server_args),
+                 dtype=target_dtype,
+                 device=latents.device,
++                kv_cache_kwargs=self._causal_kv_cache_kwargs_for_batch(batch),
+             )
+         else:
+             assert self.crossattn_cache is not None
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_cache_sizing.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_cache_sizing.py
+new file mode 100644
+index 0000000000..ab88ad17c3
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_cache_sizing.py
+@@ -0,0 +1,87 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Causal DMD stage: DiT-config local window and request-scoped cache geometry."""
++
++import inspect
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
++    CausalSelfAttentionKVCache,
++)
++from sglang.multimodal_gen.runtime.pipelines_core.stages import denoising
++from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
++    CausalDMDDenoisingStage,
++)
++
++
++def _transformer(**config):
++    values = dict(num_layers=2, num_frames_per_block=3, sliding_window_num_frames=21, sink_size=1)
++    values.update(config)
++    return SimpleNamespace(config=SimpleNamespace(**values))
++
++
++@pytest.fixture
++def light_init(monkeypatch):
++    """Skip DenoisingStage.__init__ (it needs global server args); keep the causal stage's own init."""
++
++    def init(self, transformer, scheduler, *args, **kwargs):
++        self.transformer, self.scheduler = transformer, scheduler
++
++    monkeypatch.setattr(denoising.DenoisingStage, "__init__", init)
++
++
++def _cache(size, sink, layers=2):
++    return [
++        CausalSelfAttentionKVCache(
++            k=torch.zeros(1, size, 1, 1),
++            v=torch.zeros(1, size, 1, 1),
++            global_end_index=torch.zeros(1, dtype=torch.long),
++            local_end_index=torch.zeros(1, dtype=torch.long),
++            cache_size=size,
++            sink_tokens=sink,
++        )
++        for _ in range(layers)
++    ]
++
++
++def test_local_window_comes_from_the_dit_config(light_init):
++    stage = CausalDMDDenoisingStage(_transformer(local_attn_size=32), None)
++    stage.num_token_per_frame = 10
++    assert stage.local_attn_size == 32
++    assert stage._get_causal_kv_cache_size() == 320
++    default = CausalDMDDenoisingStage(_transformer(), None)  # no local_attn_size: sliding window
++    default.num_token_per_frame = 10
++    assert default.local_attn_size == -1 and default._get_causal_kv_cache_size() == 210
++    stage._causal_kv_cache_frames_override = 12  # an explicit realtime KV-buffer override wins
++    assert stage._get_causal_kv_cache_size() == 120
++    assert 'getattr(self.transformer.config, "local_attn_size", -1)' in inspect.getsource(CausalDMDDenoisingStage.__init__)
++
++
++def test_stage_caches_follow_each_requests_geometry(light_init):
++    stage = CausalDMDDenoisingStage(_transformer(), None)
++    batch = SimpleNamespace(extra={})
++    stage.num_token_per_frame = 10
++    caches = _cache(210, 10)
++    assert stage._cache_needs_reinit_for_batch(None, batch)
++    assert not stage._cache_needs_reinit_for_batch(caches, batch)
++    assert stage._causal_kv_cache_kwargs_for_batch(batch) is None
++    stage.num_token_per_frame = 20  # another resolution: the stage caches no longer fit
++    assert stage._cache_needs_reinit_for_batch(caches, batch)
++    stage.num_token_per_frame = 10
++    assert stage._cache_needs_reinit_for_batch(_cache(210, 0), batch)  # sink geometry differs
++    assert stage._cache_needs_reinit_for_batch(_cache(210, 10, layers=3), batch)
++
++    class FullHistoryStage(CausalDMDDenoisingStage):
++        def _causal_kv_cache_size_for_batch(self, batch):
++            return batch.total_frames * self.num_token_per_frame
++
++    full = FullHistoryStage(_transformer(), None)
++    full.num_token_per_frame = 10
++    request = SimpleNamespace(extra={}, total_frames=36)
++    assert full._causal_kv_cache_kwargs_for_batch(request) == {"kv_cache_size": 360}
++    assert full._cache_needs_reinit_for_batch(caches, request)
++    assert not full._cache_needs_reinit_for_batch(_cache(360, 10), request)
++    source = inspect.getsource(CausalDMDDenoisingStage.forward)
++    assert "_cache_needs_reinit_for_batch(self.causal_kv_cache, batch)" in source
+-- 
+2.47.1
+

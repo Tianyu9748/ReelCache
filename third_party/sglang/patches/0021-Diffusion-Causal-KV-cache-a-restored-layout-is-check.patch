@@ -1,0 +1,167 @@
+From 77080d4241b40d53a697141ae3a51ddbdd6f3b4c Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 17:34:02 -0400
+Subject: [PATCH 21/26] [Diffusion] Causal KV cache: a restored layout is
+ checked once and only its unwritten slots are zeroed
+
+install_restored_history ran the layout check for every layer's cache and
+zeroed every live slot before the restore overwrote the attended ones (the
+whole history's K/V: 6.9 GB of writes at 8 CausVid chunks, on the forward's
+stream ahead of the restore). The check is now cached per layout value (a
+restore installs one layout into 30 caches; a cached plan reuses it across
+requests), and only the live slots no span writes (live, not attended:
+evicted by the next append before any read) are zeroed. The attended slots
+must be written in full by write() or by the backend before the first read,
+as both the plain and the layer-overlapped restore do. Step 11 F5 cut 5
+(coordinator 17:40).
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_attention_cache.py  | 48 +++++++++++++++---
+ .../test/unit/test_causal_kv_overlap.py       | 49 +++++++++++++++++++
+ 2 files changed, 89 insertions(+), 8 deletions(-)
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+index c846559493..d7e02cc91a 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import functools
+ import itertools
+ from collections.abc import Callable, Sequence
+ from dataclasses import dataclass, field
+@@ -105,6 +106,29 @@ def _check_restored_layout(layout: "CausalKVCacheLayout") -> None:
+             raise ValueError("restored span is not part of the live layout")
+ 
+ 
++# A restore installs one layout into every layer's cache (a cached plan reuses it
++# across requests): its checks run once per layout value. Errors are not cached.
++_checked_layout = functools.lru_cache(maxsize=64)(_check_restored_layout)
++
++
++@functools.lru_cache(maxsize=64)
++def _unwritten_slots(layout: "CausalKVCacheLayout") -> tuple[tuple[int, int], ...]:
++    """Live slots ``[0, local_end)`` outside every attended span: the slots a
++    restore does not write (live but not attended, evicted by the next append
++    before any read). None attended means every live slot is written."""
++    if layout.attended is None:
++        return ()
++    holes, cursor = [], 0
++    attended = sorted((span.local_start, span.local_end) for span in layout.attended)
++    for start, end in attended:
++        if start > cursor:
++            holes.append((cursor, min(start, layout.local_end_index)))
++        cursor = max(cursor, end)
++    if cursor < layout.local_end_index:
++        holes.append((cursor, layout.local_end_index))
++    return tuple((start, end) for start, end in holes if end > start)
++
++
+ @dataclass(frozen=True, slots=True)
+ class CausalKVIndexState:
+     """Cursors, pinned shot sink and geometry of a cache, tagged with its K/V contents.
+@@ -784,10 +808,14 @@ class CausalSelfAttentionKVCache:
+     ) -> None:
+         """Install restored post-RoPE K and V into a freshly reset cache.
+ 
+-        Live slots are zeroed, ``write(span, k_slots, v_slots)`` fills every
+-        attended span (all live spans when ``layout.attended`` is None) through
+-        ``[B, span.length, H, D]`` views of this cache, then the write cursors
+-        and pinned shot sink are set, honoring the sink/window geometry.
++        ``write(span, k_slots, v_slots)`` fills every attended span (all live
++        spans when ``layout.attended`` is None) through ``[B, span.length, H,
++        D]`` views of this cache; the attended slots must be written in full,
++        by ``write`` or by the backend before the cache's first read (a
++        layer-overlapped restore, ``restore_pending``). The other live slots
++        (never read: the next append evicts them) are zeroed. Then the write
++        cursors and pinned shot sink are set, honoring the sink/window
++        geometry. The layout's checks run once per layout value.
+         """
+         if (
+             layout.cache_size,
+@@ -806,12 +834,16 @@ class CausalSelfAttentionKVCache:
+         local_end = layout.local_end_index
+         if not 0 <= local_end <= self.cache_size or layout.global_end_index < local_end:
+             raise ValueError("restored layout cursors are outside the cache")
+-        # O(spans) (was O(slots) per layer: 40-140 ms per restore of 30 layers at 4-8 CausVid chunks)
+-        _check_restored_layout(layout)
++        # O(spans), once per layout (was O(slots) per layer: 40-140 ms per restore
++        # of 30 layers at 4-8 CausVid chunks)
++        _checked_layout(layout)
+         spans = layout.live if layout.attended is None else layout.attended
+         self.mutation_generation = _next_kv_mutation()
+-        self.k[:, :local_end].zero_()
+-        self.v[:, :local_end].zero_()
++        # Only the slots no span writes (was all of [0, local_end): the whole
++        # history's K/V, 6.9 GB at 8 CausVid chunks, before the first write)
++        for start, end in _unwritten_slots(layout):
++            self.k[:, start:end].zero_()
++            self.v[:, start:end].zero_()
+         for span in spans:
+             write(
+                 span,
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
+index dcf3bee9db..aa2b98f281 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
+@@ -197,6 +197,55 @@ def test_the_span_check_decides_like_the_per_slot_check():
+         assert _outcome(_per_slot_check, layout) is None and _outcome(_check_restored_layout, layout) is None
+ 
+ 
++def test_install_zeroes_only_the_live_slots_no_span_writes():
++    """The attended slots are left to the restore (never written here, so they keep what the buffer held), the live
++    slots the next chunk does not attend are zeroed, and slots past the cursor are untouched."""
++    from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
++        _unwritten_slots,
++    )
++
++    chunks = CACHE_FRAMES // CHUNK_FRAMES + 1  # past a full window: live slots the next chunk does not read
++    cache = _cache()
++    layout = cache.replay_layout(
++        [(index * CHUNK, CHUNK, False) for index in range(chunks)],
++        next_chunk=(chunks * CHUNK, CHUNK),
++    )
++    holes = _unwritten_slots(layout)
++    assert holes
++    cache.k.fill_(5.0)  # a previous request's K/V; the cursors are reset
++    cache.v.fill_(5.0)
++    cache.install_restored_history(layout, lambda span, k, v: None)
++
++    def mask(intervals):
++        selected = torch.zeros(cache.cache_size, dtype=torch.bool)
++        for start, end in intervals:
++            selected[start:end] = True
++        return selected
++
++    zeroed = mask(holes)
++    attended = mask((span.local_start, span.local_end) for span in layout.attended)
++    live = mask((span.local_start, span.local_end) for span in layout.live)
++    assert not torch.any(zeroed & attended) and torch.equal(zeroed | attended, live)
++    for buffer in (cache.k, cache.v):
++        assert torch.all(buffer[0, zeroed] == 0) and torch.all(buffer[0, ~zeroed] == 5.0)
++    assert _unwritten_slots(_cache().replay_layout([(0, CHUNK, False)])) == ()  # all live slots written
++
++
++def test_a_layout_installed_into_every_layer_is_checked_once():
++    from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
++        _checked_layout,
++    )
++
++    layout = _cache().replay_layout(
++        [(0, CHUNK, False), (CHUNK, CHUNK, False)], next_chunk=(2 * CHUNK, CHUNK)
++    )
++    _checked_layout.cache_clear()
++    for _ in range(30):
++        _cache().install_restored_history(layout, lambda span, k, v: None)
++    info = _checked_layout.cache_info()
++    assert (info.misses, info.hits) == (1, 29)
++
++
+ def test_a_multi_shot_layout_with_a_pinned_shot_is_awaited_before_the_roll():
+     """LongLive 2.0 geometry: a global sink and a pinned shot sink (a scene cut pins its chunk), a full window that
+     rolls on the next append. The background restore (written at the wait) gives the same cache, cursors and pin as
+-- 
+2.47.1
+

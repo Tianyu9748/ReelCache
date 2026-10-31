@@ -1,0 +1,391 @@
+From 928a9f3b7043c3d315f9509c0884e9609c4d1d27 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 17:18:06 -0400
+Subject: [PATCH 09/26] [Diffusion] Causal KV seam: resident session KV across
+ requests
+
+Archival runs behind generation, so a backend can keep a session's native
+KV resident between requests instead of restoring it from the archive.
+The stages already keep their caches across requests and only reset the
+cursors; what was missing is a way to tell that nothing wrote the K/V
+since (inference tensors have no version counter).
+
+* CausalSelfAttentionKVCache.mutation_generation: a process-unique tag
+  renewed by every method that writes k/v (update, growth, restore
+  install), never by cursor/pin changes.
+* index_state() / holds_index_state() / restore_index_state(): record the
+  cursors, pinned shot sink and geometry at the end of a request and
+  reinstate them over unchanged K/V (ValueError otherwise).
+* causal_kv_session gains an optional bool "durable": whether the request
+  returns only once its chunks are archived (backend default otherwise).
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_attention_cache.py  |  93 ++++++++++++-
+ .../layers/kvcache/causal_kv_backend.py       |  20 ++-
+ .../test/unit/test_causal_kv_backend.py       |   3 +
+ .../test/unit/test_causal_kv_resident.py      | 131 ++++++++++++++++++
+ 4 files changed, 244 insertions(+), 3 deletions(-)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_causal_kv_resident.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+index 445fc5f312..f87e3cd67d 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+@@ -1,10 +1,17 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import itertools
+ from collections.abc import Callable, Sequence
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ 
+ import torch
+ 
++_KV_MUTATIONS = itertools.count(1)
++
++
++def _next_kv_mutation() -> int:
++    return next(_KV_MUTATIONS)
++
+ 
+ @dataclass(frozen=True, slots=True)
+ class CausalKVSlotSpan:
+@@ -58,6 +65,27 @@ def _position_spans(
+     return tuple(spans)
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class CausalKVIndexState:
++    """Cursors, pinned shot sink and geometry of a cache, tagged with its K/V contents.
++
++    Taken with ``CausalSelfAttentionKVCache.index_state`` (e.g. at the end of a
++    request); ``restore_index_state`` reinstates it only while
++    ``mutation_generation`` still matches, i.e. no K/V write happened since.
++    """
++
++    mutation_generation: int
++    global_end_index: int
++    local_end_index: int
++    pinned_start: int
++    pinned_len: int
++    cache_size: int
++    sink_tokens: int
++    global_sink_tokens: int
++    attention_window_size: int
++    allow_growth: bool
++
++
+ @dataclass(slots=True)
+ class CausalAttentionKVView:
+     k: torch.Tensor
+@@ -94,6 +122,13 @@ class CausalSelfAttentionKVCache:
+     # stores K/V only from ``max(local_start, sink)``: the sink keeps its KV and
+     # the indices do not move (upstream LongLive ``is_recompute`` rule).
+     protect_sink_on_recompute: bool = False
++    # Process-unique tag of the K/V contents: renewed by every method that writes
++    # ``k``/``v`` (never by cursor/pin changes such as ``reset_indices``). Stages
++    # keep their caches across requests and only reset the cursors, so an equal
++    # tag means this cache object still holds the same K/V (see ``index_state``).
++    mutation_generation: int = field(
++        default_factory=_next_kv_mutation, compare=False, repr=False
++    )
+ 
+     def __post_init__(self) -> None:
+         if self.cache_size == 0:
+@@ -162,6 +197,7 @@ class CausalSelfAttentionKVCache:
+     def _grow_to_fit(self, required_tokens: int) -> None:
+         if required_tokens <= self.cache_size:
+             return
++        self.mutation_generation = _next_kv_mutation()
+         old_cache_size = self.cache_size
+         new_cache_size = max(required_tokens, old_cache_size * 2)
+ 
+@@ -215,6 +251,7 @@ class CausalSelfAttentionKVCache:
+                 chunk. Negative values are invalid.
+ 
+         """
++        self.mutation_generation = _next_kv_mutation()
+         num_new_tokens = key.shape[1]
+         num_input_heads = key.shape[2]
+         num_cache_heads = self.k.shape[2]
+@@ -722,6 +759,7 @@ class CausalSelfAttentionKVCache:
+                 for slot in (span.local_start, span.local_end - 1)
+             ):
+                 raise ValueError("restored span is not part of the live layout")
++        self.mutation_generation = _next_kv_mutation()
+         self.k[:, :local_end].zero_()
+         self.v[:, :local_end].zero_()
+         for span in spans:
+@@ -736,6 +774,59 @@ class CausalSelfAttentionKVCache:
+         self.pinned_start = layout.pinned_start
+         self.pinned_len = layout.pinned_len
+ 
++    def index_state(self) -> CausalKVIndexState:
++        """Cursors, pinned sink and geometry now, tagged with the current K/V contents."""
++        global_end, local_end = self._read_indices()
++        return CausalKVIndexState(
++            mutation_generation=self.mutation_generation,
++            global_end_index=global_end,
++            local_end_index=local_end,
++            pinned_start=self.pinned_start,
++            pinned_len=self.pinned_len,
++            cache_size=self.cache_size,
++            sink_tokens=self.sink_tokens,
++            global_sink_tokens=self.global_sink_tokens,
++            attention_window_size=self.attention_window_size,
++            allow_growth=self.allow_growth,
++        )
++
++    def holds_index_state(self, state: CausalKVIndexState) -> bool:
++        """True when ``state`` was taken from this cache and no K/V write happened since."""
++        return (
++            state.mutation_generation,
++            state.cache_size,
++            state.sink_tokens,
++            state.global_sink_tokens,
++            state.attention_window_size,
++            state.allow_growth,
++        ) == (
++            self.mutation_generation,
++            self.cache_size,
++            self.sink_tokens,
++            self.global_sink_tokens,
++            self.attention_window_size,
++            self.allow_growth,
++        )
++
++    def restore_index_state(self, state: CausalKVIndexState) -> None:
++        """Reinstate the cursors and pinned sink of ``state`` over unchanged K/V.
++
++        Lets a backend continue a session on native KV that stayed resident in
++        this cache between requests (the stage only resets the cursors). Raises
++        ``ValueError`` when the K/V contents or the geometry changed since
++        ``state`` was taken.
++        """
++        if not self.holds_index_state(state):
++            raise ValueError(
++                "causal KV cache contents changed since the index state was taken"
++            )
++        self._write_indices(
++            global_end_index=state.global_end_index,
++            local_end_index=state.local_end_index,
++        )
++        self.pinned_start = state.pinned_start
++        self.pinned_len = state.pinned_len
++
+ 
+ @dataclass(slots=True)
+ class CrossAttentionKVCache:
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+index 869bd8b1be..9038303c5d 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+@@ -24,6 +24,15 @@ created once per GPU worker by :func:`attach_causal_kv_backend` and receives:
+   history is installed into ``CausalSelfAttentionKVCache`` slots with
+   ``install_restored_history`` and re-rotated with the engine's own RoPE.
+ 
++Archival runs behind generation: a backend may return from ``finish`` while
++the request's chunks are still being archived, and keep a session's native KV
++*resident* for its next request. The stage keeps its caches across requests
++and only resets their cursors, so a backend that recorded
++``CausalSelfAttentionKVCache.index_state()`` at the end of a request can
++``restore_index_state`` it at the next request of the same session when
++``mutation_generation`` shows that nothing wrote the K/V since (any other
++request, restore or growth renews it).
++
+ Everything crossing this seam is plain data or a live tensor owned by the
+ worker; nothing here is serialized into requests.
+ """
+@@ -46,6 +55,7 @@ _SESSION_KEYS = {
+     "from_session",
+     "checkpoint",
+     "replace",
++    "durable",
+ }
+ 
+ 
+@@ -56,8 +66,10 @@ def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
+     ``session_id`` (str), ``action`` (one of :data:`SESSION_ACTIONS`, default
+     ``generate``), optional ``pause_after_chunks`` (positive int: pause at the
+     clean boundary after that many chunks of the session), ``from_session``
+-    (fork source), ``checkpoint`` (node reference or chunk count) and
+-    ``replace`` (bool, ``generate`` only). Live objects are rejected.
++    (fork source), ``checkpoint`` (node reference or chunk count),
++    ``replace`` (bool, ``generate`` only) and ``durable`` (bool: whether the
++    request returns only once its chunks are archived; the backend's default
++    applies when absent). Live objects are rejected.
+     """
+     if value is None:
+         return None
+@@ -90,11 +102,15 @@ def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
+     replace = value.get("replace", False)
+     if type(replace) is not bool or (replace and action != "generate"):
+         raise ValueError("causal_kv_session.replace is a bool for generate only")
++    durable = value.get("durable")
++    if durable is not None and type(durable) is not bool:
++        raise ValueError("causal_kv_session.durable must be a bool")
+     result = {"session_id": session_id, "action": action, "replace": replace}
+     for name, item in (
+         ("pause_after_chunks", pause),
+         ("from_session", source),
+         ("checkpoint", checkpoint),
++        ("durable", durable),
+     ):
+         if item is not None:
+             result[name] = item
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_backend.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_backend.py
+index 7298f5e797..2b2816ac46 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_causal_kv_backend.py
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_backend.py
+@@ -136,7 +136,10 @@ def test_session_handle_validation():
+     assert seam.validate_causal_kv_session(
+         {"session_id": "s2", "action": "fork", "from_session": "s1", "checkpoint": 1}
+     )["from_session"] == "s1"
++    assert seam.validate_causal_kv_session({"session_id": "s1", "durable": False})["durable"] is False
++    assert "durable" not in seam.validate_causal_kv_session({"session_id": "s1"})
+     for bad in (
++        {"session_id": "s", "durable": 1},
+         {"session_id": ""},
+         {"session_id": "a/b"},
+         {"session_id": "s", "action": "pause"},
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_resident.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_resident.py
+new file mode 100644
+index 0000000000..97467e303c
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_resident.py
+@@ -0,0 +1,131 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Resident causal KV across requests: K/V mutation generation and index state."""
++
++import pytest
++import torch
++
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
++    CausalSelfAttentionKVCache,
++)
++
++TPF, CHUNK_FRAMES, CACHE_FRAMES = 2, 3, 12
++CHUNK = CHUNK_FRAMES * TPF
++
++
++def _cache(*, sink_frames=3, global_sink_frames=3, allow_growth=False, cache_frames=CACHE_FRAMES):
++    shape = [1, cache_frames * TPF, 2, 4]
++    return CausalSelfAttentionKVCache(
++        k=torch.zeros(shape),
++        v=torch.zeros(shape),
++        global_end_index=torch.zeros(1, dtype=torch.long),
++        local_end_index=torch.zeros(1, dtype=torch.long),
++        cache_size=cache_frames * TPF,
++        sink_tokens=sink_frames * TPF,
++        global_sink_tokens=global_sink_frames * TPF,
++        allow_growth=allow_growth,
++    )
++
++
++def _chunk(cache, index, generator, *, pin=False):
++    """A denoising write and then the clean write of chunk ``index`` (as the stages do)."""
++    view = None
++    for _ in range(2):
++        key = torch.randn(1, CHUNK, 2, 4, generator=generator)
++        view = cache.update_and_get_attention_kv(key=key, value=key * 2, current_chunk_start=index * CHUNK)
++    if pin:
++        cache.pin_current_chunk(CHUNK)
++    return view
++
++
++def test_generation_renews_on_kv_writes_only():
++    cache = _cache()
++    other = _cache()
++    assert cache.mutation_generation != other.mutation_generation
++    generator = torch.Generator().manual_seed(0)
++    seen = {cache.mutation_generation}
++    _chunk(cache, 0, generator)
++    assert cache.mutation_generation not in seen
++    seen.add(cache.mutation_generation)
++    generation = cache.mutation_generation
++    cache.pin_current_chunk(CHUNK)
++    cache.reset_pinned_sink()
++    cache._read_indices()
++    cache.reset_indices()
++    assert cache.mutation_generation == generation  # cursors and pins only
++
++    layout = cache.replay_layout([(0, CHUNK, False)])
++    assert cache.mutation_generation == generation  # the replay runs on a CPU shadow
++    cache.install_restored_history(layout, lambda span, k, v: None)
++    assert cache.mutation_generation not in seen
++
++    growable = _cache(sink_frames=0, global_sink_frames=0, allow_growth=True, cache_frames=1)
++    before = growable.mutation_generation
++    growable._grow_to_fit(4 * CHUNK)
++    assert growable.mutation_generation != before
++    grown = growable.mutation_generation
++    growable._grow_to_fit(CHUNK)  # no growth needed: unchanged
++    assert growable.mutation_generation == grown
++
++
++@pytest.mark.parametrize("pins", [set(), {1, 4}])
++def test_restored_index_state_continues_bitwise(pins):
++    """Request 1 (chunks 0..4) ends; the stage resets cursors; request 2 reinstates them and continues."""
++    generator = torch.Generator().manual_seed(1)
++    resident = _cache()
++    for index in range(5):
++        _chunk(resident, index, generator, pin=index in pins)
++    state = resident.index_state()
++    reference = CausalSelfAttentionKVCache(
++        k=resident.k.clone(),
++        v=resident.v.clone(),
++        global_end_index=resident.global_end_index.clone(),
++        local_end_index=resident.local_end_index.clone(),
++        global_end_index_int=resident.global_end_index_int,
++        local_end_index_int=resident.local_end_index_int,
++        cache_size=resident.cache_size,
++        sink_tokens=resident.sink_tokens,
++        global_sink_tokens=resident.global_sink_tokens,
++        pinned_start=resident.pinned_start,
++        pinned_len=resident.pinned_len,
++    )
++    resident.reset_indices()  # the next request's stage reset
++    assert resident._read_indices() == (0, 0) and resident.pinned_start == -1
++    assert resident.holds_index_state(state)
++    resident.restore_index_state(state)
++    assert resident._read_indices() == (state.global_end_index, state.local_end_index)
++    assert (resident.pinned_start, resident.pinned_len) == (state.pinned_start, state.pinned_len)
++    assert int(resident.global_end_index.item()) == state.global_end_index
++    assert int(resident.local_end_index.item()) == state.local_end_index
++    resumed, uninterrupted = torch.Generator().manual_seed(2), torch.Generator().manual_seed(2)
++    for index in range(5, 9):
++        view = _chunk(resident, index, resumed, pin=index in pins)
++        expected = _chunk(reference, index, uninterrupted, pin=index in pins)
++        assert torch.equal(view.k, expected.k) and torch.equal(view.v, expected.v)
++    assert torch.equal(resident.k, reference.k) and torch.equal(resident.v, reference.v)
++    assert resident._read_indices() == reference._read_indices()
++
++
++def test_index_state_is_refused_after_any_kv_write_or_reallocation():
++    generator = torch.Generator().manual_seed(3)
++    cache = _cache()
++    for index in range(3):
++        _chunk(cache, index, generator)
++    state = cache.index_state()
++    cache.reset_indices()
++    _chunk(cache, 0, generator)  # another request wrote the cache
++    cache.reset_indices()
++    assert not cache.holds_index_state(state)
++    with pytest.raises(ValueError):
++        cache.restore_index_state(state)
++    assert cache._read_indices() == (0, 0)  # refused without touching the cursors
++
++    copy = CausalSelfAttentionKVCache(  # same contents, another object (stage re-init)
++        k=cache.k.clone(),
++        v=cache.v.clone(),
++        global_end_index=torch.zeros(1, dtype=torch.long),
++        local_end_index=torch.zeros(1, dtype=torch.long),
++        cache_size=cache.cache_size,
++        sink_tokens=cache.sink_tokens,
++        global_sink_tokens=cache.global_sink_tokens,
++    )
++    assert not copy.holds_index_state(cache.index_state())
+-- 
+2.47.1
+

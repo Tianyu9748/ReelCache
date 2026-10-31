@@ -1,0 +1,204 @@
+From 053ef5672eb6c8a32ab63cb008fcab05cd4cabe4 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:27:21 -0400
+Subject: [PATCH 06/26] [Diffusion] Causal KV cache: opt-in sink protection for
+ in-place recompute writes
+
+CausalSelfAttentionKVCache.protect_sink_on_recompute (default False, so every
+existing caller is unchanged): a write that recomputes already generated tokens
+in place (current_chunk_end <= global_end and current_chunk_start > 0, upstream
+LongLive's is_recompute) stores K/V only from max(local_start, sink); the sink
+keeps its KV, the indices do not move and attention reads sink + rewritten
+window. Without it a LongLive 1.0 prompt-switch KV recache overwrites the
+global sink. Head-sliced writes are supported.
+
+Tests: protected recompute == a transcription of the upstream rule, the
+unprotected default is e00930c's overwrite, ordinary appends are identical
+with the flag on, head slices, a write at token 0 is never a recompute.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_attention_cache.py  |  28 ++++-
+ .../unit/test_causal_kv_recompute_sink.py     | 101 ++++++++++++++++++
+ 2 files changed, 125 insertions(+), 4 deletions(-)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_causal_kv_recompute_sink.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+index 6adc3afb8a..445fc5f312 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+@@ -88,6 +88,12 @@ class CausalSelfAttentionKVCache:
+     global_sink_tokens: int = 0
+     pinned_start: int = -1
+     pinned_len: int = 0
++    # Opt-in (default off: unchanged behavior). When true, a write that recomputes
++    # already generated tokens in place (``current_chunk_end <= global_end`` and
++    # ``current_chunk_start > 0``, e.g. a LongLive 1.0 prompt-switch KV recache)
++    # stores K/V only from ``max(local_start, sink)``: the sink keeps its KV and
++    # the indices do not move (upstream LongLive ``is_recompute`` rule).
++    protect_sink_on_recompute: bool = False
+ 
+     def __post_init__(self) -> None:
+         if self.cache_size == 0:
+@@ -234,6 +240,9 @@ class CausalSelfAttentionKVCache:
+         # the global position of the start of the buffer
+         window_start = global_end_index - local_end_index_prev
+ 
++        # first slot this call writes (only differs from local_start_index for a
++        # sink-protected recompute, see ``protect_sink_on_recompute``)
++        write_start_index = None
+         if current_chunk_end <= global_end_index:
+             # the window stays as previous
+             # cache layout:
+@@ -244,6 +253,8 @@ class CausalSelfAttentionKVCache:
+             # the local end and global end remains unchanged (since the chunk hasn't proceed)
+             updated_local_end = local_end_index_prev
+             updated_global_end = global_end_index
++            if self.protect_sink_on_recompute and current_chunk_start > 0:
++                write_start_index = max(local_start_index, sink_tokens)
+         else:
+             # the chunk window has proceed, append new tokens, and evict earliest (if have to)
+             appended_tokens = current_chunk_end - global_end_index
+@@ -349,10 +360,19 @@ class CausalSelfAttentionKVCache:
+             self.v = self.v.detach()
+         attn_start_index = max(0, updated_local_end - self.attention_window_size)
+ 
++        if write_start_index is not None:
++            # sink-protected recompute: drop the tokens that would land in the sink
++            offset = min(write_start_index - local_start_index, num_new_tokens)
++            key = key[:, offset:]
++            value = value[:, offset:]
++            write_start_index = local_start_index + offset
++        else:
++            write_start_index = local_start_index
++
+         # write fresh kv and return visible view
+         if cache_head_slice is None:
+-            self.k[:, local_start_index:local_end_index] = key
+-            self.v[:, local_start_index:local_end_index] = value
++            self.k[:, write_start_index:local_end_index] = key
++            self.v[:, write_start_index:local_end_index] = value
+             visible_k, visible_v = self._visible_attention_kv(
+                 local_start_index=local_start_index,
+                 updated_local_end=updated_local_end,
+@@ -360,8 +380,8 @@ class CausalSelfAttentionKVCache:
+                 recent_window_tokens=recent_window_tokens,
+             )
+         else:
+-            self.k[:, local_start_index:local_end_index, cache_head_slice, :] = key
+-            self.v[:, local_start_index:local_end_index, cache_head_slice, :] = value
++            self.k[:, write_start_index:local_end_index, cache_head_slice, :] = key
++            self.v[:, write_start_index:local_end_index, cache_head_slice, :] = value
+             visible_k, visible_v = self._visible_attention_kv(
+                 local_start_index=local_start_index,
+                 updated_local_end=updated_local_end,
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_recompute_sink.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_recompute_sink.py
+new file mode 100644
+index 0000000000..851ab54008
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_recompute_sink.py
+@@ -0,0 +1,101 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Opt-in sink protection for in-place recompute writes (LongLive 1.0 prompt-switch recache)."""
++
++import pytest
++import torch
++
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
++    CausalSelfAttentionKVCache,
++)
++
++TPF, CHUNK_FRAMES, SINK_FRAMES, CACHE_FRAMES, CHUNKS = 2, 3, 3, 12, 10
++
++
++def _cache(protect, *, heads=2, global_sink=0):
++    shape = [1, CACHE_FRAMES * TPF, heads, 4]
++    return CausalSelfAttentionKVCache(
++        k=torch.zeros(shape),
++        v=torch.zeros(shape),
++        global_end_index=torch.zeros(1, dtype=torch.long),
++        local_end_index=torch.zeros(1, dtype=torch.long),
++        cache_size=CACHE_FRAMES * TPF,
++        sink_tokens=SINK_FRAMES * TPF,
++        global_sink_tokens=global_sink,
++        protect_sink_on_recompute=protect,
++    )
++
++
++def _generate(cache, generator, heads=2):
++    for index in range(CHUNKS):
++        start = index * CHUNK_FRAMES * TPF
++        for _ in range(2):  # a denoising write, then the clean write of the same chunk
++            key = torch.randn(1, CHUNK_FRAMES * TPF, heads, 4, generator=generator)
++            cache.update_and_get_attention_kv(key=key, value=-key, current_chunk_start=start)
++
++
++def _upstream_recompute(k, v, local_start, sink, key, value):
++    """Transcription of upstream LongLive's ``is_recompute`` write: from max(local_start, sink)."""
++    write_start = max(local_start, sink)
++    offset = write_start - local_start
++    k = k.clone()
++    v = v.clone()
++    k[:, write_start : local_start + key.shape[1]] = key[:, offset:]
++    v[:, write_start : local_start + key.shape[1]] = value[:, offset:]
++    return k, v
++
++
++@pytest.mark.parametrize("protect", [False, True])
++def test_recache_recompute_keeps_sink_only_when_enabled(protect):
++    generator = torch.Generator().manual_seed(3)
++    cache = _cache(protect)
++    _generate(cache, generator)
++    before_k, before_v = cache.k.clone(), cache.v.clone()
++    indices = cache._read_indices()
++    assert indices == (CHUNKS * CHUNK_FRAMES * TPF, CACHE_FRAMES * TPF)
++    # Recache: the last 12 frames under a new prompt, one unmasked clean forward.
++    window = CACHE_FRAMES * TPF
++    start = indices[0] - window
++    key = torch.randn(1, window, 2, 4, generator=generator)
++    view = cache.update_and_get_attention_kv(key=key, value=-key, current_chunk_start=start)
++    assert cache._read_indices() == indices  # a recompute never moves the indices
++    sink = SINK_FRAMES * TPF
++    if protect:
++        expected_k, expected_v = _upstream_recompute(before_k, before_v, 0, sink, key, -key)
++        assert torch.equal(cache.k, expected_k) and torch.equal(cache.v, expected_v)
++        assert torch.equal(cache.k[:, :sink], before_k[:, :sink])  # sink KV kept
++    else:  # e00930c behavior (unchanged by default): the sink is overwritten
++        assert torch.equal(cache.k, key) and torch.equal(cache.v, -key)
++    assert torch.equal(view.k, cache.k) and torch.equal(view.v, cache.v)  # attends sink + rewritten window
++
++
++def test_protection_never_changes_appends_and_supports_head_slices():
++    generator = torch.Generator().manual_seed(5)
++    plain, protected = _cache(False, heads=4), _cache(True, heads=4)
++    for index in range(CHUNKS):  # ordinary appends (head-sliced writes): identical with the flag
++        start = index * CHUNK_FRAMES * TPF
++        for head_start in (0, 2):
++            key = torch.randn(1, CHUNK_FRAMES * TPF, 2, 4, generator=generator)
++            for cache in (plain, protected):
++                cache.update_and_get_attention_kv(
++                    key=key, value=key, current_chunk_start=start, cache_head_start=head_start
++                )
++    assert torch.equal(plain.k, protected.k) and plain._read_indices() == protected._read_indices()
++    before = protected.k.clone()
++    end = protected._read_indices()[0]
++    # A 10-frame recompute starts 2 frames before the end of the 3-frame sink.
++    sink, recompute = SINK_FRAMES * TPF, 10 * TPF
++    key = torch.randn(1, recompute, 2, 4, generator=generator)
++    protected.update_and_get_attention_kv(
++        key=key, value=key, current_chunk_start=end - recompute, cache_head_start=2
++    )
++    local_start = CACHE_FRAMES * TPF - recompute
++    assert torch.equal(protected.k[:, :sink], before[:, :sink])
++    assert torch.equal(protected.k[:, sink:, 2:], key[:, sink - local_start :])
++    assert torch.equal(protected.k[:, sink:, :2], before[:, sink:, :2])
++    # A recompute that starts at token 0 is not a recompute (upstream: current_start > 0).
++    fresh = _cache(True)
++    first = torch.randn(1, CHUNK_FRAMES * TPF, 2, 4, generator=generator)
++    fresh.update_and_get_attention_kv(key=first, value=first, current_chunk_start=0)
++    again = torch.randn(1, CHUNK_FRAMES * TPF, 2, 4, generator=generator)
++    fresh.update_and_get_attention_kv(key=again, value=again, current_chunk_start=0)
++    assert torch.equal(fresh.k[:, : CHUNK_FRAMES * TPF], again)
+-- 
+2.47.1
+

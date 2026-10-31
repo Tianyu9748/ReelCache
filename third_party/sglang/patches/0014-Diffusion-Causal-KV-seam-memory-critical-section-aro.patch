@@ -1,0 +1,189 @@
+From 21ed49ba4ac967c6719e2cdda542de25c497038f Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 02:56:37 -0400
+Subject: [PATCH 14/26] [Diffusion] Causal KV seam: memory-critical section
+ around the VAE decode
+
+An attached backend that declares memory_critical_section(reason, request_id=...)
+is registered at attach; DecodingStage runs its VAE decode inside
+causal_kv_memory_critical_section("vae_decode", batch), so background archival
+can defer its GPU work there (ReelCache: ArchivePipeline.defer_gpu_work). A no-op
+context without --reelcache-enable or without a declaring backend.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_kv_backend.py       | 25 +++++
+ .../runtime/pipelines_core/stages/decoding.py |  6 +-
+ .../unit/test_causal_kv_session_controls.py   | 91 +++++++++++++++++++
+ 3 files changed, 121 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+index 22efe951fb..74c8ad3144 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+@@ -333,6 +333,30 @@ def assign_causal_attention_layer_indices(blocks: Sequence[Any]) -> None:
+             attention.layer_index = index
+ 
+ 
++# --- memory-critical sections -----------------------------------------------------
++
++_MEMORY_CRITICAL: Callable[..., Any] | None = None
++
++
++def causal_kv_memory_critical_section(reason: str, batch: Any = None):
++    """A memory-critical section of this worker (e.g. the VAE decode).
++
++    The attached backend's ``memory_critical_section(reason, request_id=...)``
++    when it declares one (``--reelcache-enable``: background archival defers its GPU
++    work there); a no-op context otherwise (always when disabled).
++    """
++    section = _MEMORY_CRITICAL
++    if section is None:
++        return contextlib.nullcontext()
++    return section(reason, request_id=getattr(batch, "request_id", None))
++
++
++def _register_memory_critical_section(backend: Any) -> None:
++    global _MEMORY_CRITICAL
++    section = getattr(backend, "memory_critical_section", None)
++    _MEMORY_CRITICAL = section if callable(section) else None
++
++
+ # --- worker attachment ---------------------------------------------------------
+ 
+ 
+@@ -388,4 +412,5 @@ def attach_causal_kv_backend(pipeline: Any, server_args: Any) -> CausalKVBackend
+     )
+     for stage in stages:
+         stage.set_causal_kv_backend(backend)
++    _register_memory_critical_section(backend)
+     return backend
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
+index 3469277e2e..995ec93717 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding.py
+@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.distributed import (
+     get_local_torch_device,
+     model_parallel_is_initialized,
+ )
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import (
++    causal_kv_memory_critical_section,
++)
+ from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
+ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+     ComponentUse,
+@@ -363,10 +366,11 @@ class DecodingStage(PipelineStage):
+             assert vae is not None
+             self.vae = vae
+ 
++            # --reelcache-enable: background archival defers its GPU work during the decode
+             with use_vae_fast_path(
+                 vae,
+                 quality_allows_kernel_fusions(batch.sampling_params.quality),
+-            ):
++            ), causal_kv_memory_critical_section("vae_decode", batch):
+                 latents, keep_latents = _causal_kv_decode_window(batch)
+                 frames = self.decode(latents, server_args, vae_dtype=vae_dtype)
+                 if keep_latents is not None:
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+index d407aab1c1..3d6edef339 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_session_controls.py
+@@ -448,3 +448,94 @@ def test_provider_pipelines_attach_the_backend_without_causal_stages(monkeypatch
+ 
+     with pytest.raises(ReelCacheUnavailableError):
+         seam.attach_causal_kv_backend(SimpleNamespace(stages=[]), args)
++
++
++def _recording_section(seen):
++    import contextlib
++
++    @contextlib.contextmanager
++    def section(reason, request_id=None):
++        seen.append(("enter", reason, request_id))
++        yield {"reason": reason}
++        seen.append(("exit", reason, request_id))
++
++    return section
++
++
++def test_memory_critical_section_is_a_noop_unless_the_backend_declares_one(
++    monkeypatch,
++):
++    seen = []
++    monkeypatch.setattr(seam, "_MEMORY_CRITICAL", None)
++    with seam.causal_kv_memory_critical_section(
++        "vae_decode", SimpleNamespace(request_id="r0")
++    ):
++        seen.append(("body",))
++    assert seen == [("body",)]
++    seen.clear()
++    seam._register_memory_critical_section(
++        SimpleNamespace(memory_critical_section=_recording_section(seen))
++    )
++    with seam.causal_kv_memory_critical_section(
++        "vae_decode", SimpleNamespace(request_id="r1")
++    ):
++        seen.append(("body",))
++    assert seen == [
++        ("enter", "vae_decode", "r1"),
++        ("body",),
++        ("exit", "vae_decode", "r1"),
++    ]
++    seam._register_memory_critical_section("a backend without sections")
++    assert seam._MEMORY_CRITICAL is None
++
++
++def test_decoding_stage_decodes_inside_the_memory_critical_section(monkeypatch):
++    import contextlib
++
++    seen = []
++    monkeypatch.setattr(seam, "_MEMORY_CRITICAL", _recording_section(seen))
++    stage = object.__new__(decoding.DecodingStage)
++    stage.component_name = "vae"
++    stage.vae = object()
++
++    @contextlib.contextmanager
++    def declared(self, component_name, module):
++        yield module
++
++    monkeypatch.setattr(decoding.DecodingStage, "load_model", lambda self: None)
++    monkeypatch.setattr(decoding.DecodingStage, "use_declared_component", declared)
++    monkeypatch.setattr(
++        decoding.DecodingStage,
++        "decode",
++        lambda self, latents, server_args, vae_dtype=None: seen.append(("decode",))
++        or latents,
++    )
++    monkeypatch.setattr(
++        decoding, "resolve_decode_precision", lambda *a, **k: torch.float32
++    )
++    monkeypatch.setattr(
++        decoding, "use_vae_fast_path", lambda vae, allowed: contextlib.nullcontext()
++    )
++    monkeypatch.setattr(decoding, "quality_allows_kernel_fusions", lambda q: False)
++    batch = SimpleNamespace(
++        request_id="job-1",
++        extra={},
++        latents=torch.zeros(1, 1, 2, 1, 1),
++        sampling_params=SimpleNamespace(quality=None),
++        return_trajectory_decoded=False,
++        trajectory_timesteps=None,
++        trajectory_latents=None,
++        rollout_trajectory_data=None,
++        metrics=None,
++        usage=None,
++    )
++    server_args = SimpleNamespace(
++        pipeline_config=SimpleNamespace(post_decoding=lambda frames, args: frames)
++    )
++    output = decoding.DecodingStage.forward(stage, batch, server_args)
++    assert isinstance(output, OutputBatch)
++    assert seen == [
++        ("enter", "vae_decode", "job-1"),
++        ("decode",),
++        ("exit", "vae_decode", "job-1"),
++    ]
+-- 
+2.47.1
+

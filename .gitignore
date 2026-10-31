@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Test scratch (created by the CPU suite under the repository root)
+.test-work/
+.test-artifacts/
+.core-test-artifacts/
+integrations/lingbot/tests/_work/
+
+# Rust extension: build artifacts and the built module (build it; see README)
+native/**/target/
+reelcache/_native/*.so
+*.so
+
+# Local stores and outputs
+*.mkv
+*.mp4
+*.npz

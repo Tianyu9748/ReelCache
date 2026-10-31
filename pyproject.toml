@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reelcache"
+version = "0.1.0"
+description = "Clean-boundary KV state storage for autoregressive video diffusion"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "torch>=2.2"]
+
+[project.optional-dependencies]
+hevc = ["imageio-ffmpeg>=0.5"]
+nvdec = ["PyNvVideoCodec>=2.2,<3"]
+gpu-fit = ["cupy-cuda12x>=13.6,<14"]
+gpu-fit-cu13 = ["cupy-cuda13x>=14.2,<15"]
+study = ["matplotlib>=3.7", "scikit-image>=0.21", "Pillow>=10"]
+
+[tool.setuptools.packages.find]
+include = ["reelcache*"]

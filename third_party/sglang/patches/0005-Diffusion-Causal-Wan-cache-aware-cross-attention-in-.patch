@@ -1,0 +1,188 @@
+From 8c6ad86500e7c7be669d499e19e2a1b6feac8fe6 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:27:20 -0400
+Subject: [PATCH 05/26] [Diffusion] Causal Wan: cache-aware cross-attention in
+ the stock block
+
+CausalWanTransformerBlock.forward passes crossattn_cache to self.attn2, but
+e00930c built attn2 as WanT2VCrossAttention, whose forward(x, context,
+context_lens) has no such argument: the stock causal-Wan block raised a
+TypeError on its first forward. attn2 is now CausalWanT2VCrossAttention, a
+WanT2VCrossAttention subclass (same parameters and weight names) that stores
+the projected/normalized text K/V in the block's CrossAttentionKVCache on the
+first call after a reset and reuses them afterwards (the math of LongLive2's
+_cross_attn_with_cache); without a cache it is exactly the parent forward.
+LongLive2 blocks call their own _cross_attn_with_cache and are unaffected.
+
+Tests: cached == uncached output, one context projection per cache epoch,
+reset re-projects, no-cache path identical to WanT2VCrossAttention.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../runtime/models/dits/causal_wanvideo.py    | 47 +++++++++-
+ .../unit/test_causal_wan_crossattn_cache.py   | 88 +++++++++++++++++++
+ 2 files changed, 134 insertions(+), 1 deletion(-)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_causal_wan_crossattn_cache.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py b/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py
+index e4b78b34c1..0811a09d8b 100644
+--- a/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py
++++ b/python/sglang/multimodal_gen/runtime/models/dits/causal_wanvideo.py
+@@ -218,6 +218,49 @@ class CausalWanSelfAttention(nn.Module):
+         return x
+ 
+ 
++class CausalWanT2VCrossAttention(WanT2VCrossAttention):
++    """``WanT2VCrossAttention`` that reuses the text K/V held by a ``CrossAttentionKVCache``.
++
++    The causal stages pass one cache per block: the first call after a reset
++    projects (and normalizes) the context K/V and stores them, later calls of
++    the same chunk reuse them (the same math as LongLive2's
++    ``_cross_attn_with_cache``). Without a cache it is exactly
++    ``WanT2VCrossAttention.forward``.
++    """
++
++    def forward(
++        self,
++        x,
++        context,
++        context_lens=None,
++        crossattn_cache: CrossAttentionKVCache | None = None,
++    ):
++        if crossattn_cache is None:
++            return super().forward(x, context, context_lens)
++        q, _ = self.to_q(x)
++        if self.tp_rmsnorm:
++            q = tensor_parallel_rms_norm(q, self.norm_q)
++        else:
++            q = self.norm_q(q)
++        q = q.unflatten(2, (self.local_num_heads, self.head_dim))
++        if crossattn_cache.is_init:
++            k, v = crossattn_cache.k, crossattn_cache.v
++        else:
++            k, _ = self.to_k(context)
++            if self.tp_rmsnorm:
++                k = tensor_parallel_rms_norm(k, self.norm_k)
++            else:
++                k = self.norm_k(k)
++            k = k.unflatten(2, (self.local_num_heads, self.head_dim))
++            v, _ = self.to_v(context)
++            v = v.unflatten(2, (self.local_num_heads, self.head_dim))
++            crossattn_cache.store(k, v)
++        x = self.attn(q, k, v)
++        x = x.flatten(2)
++        x, _ = self.to_out(x)
++        return x
++
++
+ class CausalWanTransformerBlock(nn.Module):
+     def __init__(
+         self,
+@@ -327,7 +370,9 @@ class CausalWanTransformerBlock(nn.Module):
+         cross_attn_backends = {
+             b for b in supported_attention_backends if not b.is_sparse
+         }
+-        self.attn2 = WanT2VCrossAttention(
++        # Cache-aware: forward() passes the block's crossattn_cache (e00930c passed it to
++        # WanT2VCrossAttention.forward, which has no such argument: TypeError).
++        self.attn2 = CausalWanT2VCrossAttention(
+             dim,
+             num_heads,
+             qk_norm=qk_norm,
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_wan_crossattn_cache.py b/python/sglang/multimodal_gen/test/unit/test_causal_wan_crossattn_cache.py
+new file mode 100644
+index 0000000000..d3c61dc6c0
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_wan_crossattn_cache.py
+@@ -0,0 +1,88 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Stock causal-Wan cross-attention honors the per-block ``crossattn_cache`` (e00930c: TypeError)."""
++
++import inspect
++
++import torch
++import torch.nn as nn
++
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
++    CrossAttentionKVCache,
++)
++from sglang.multimodal_gen.runtime.models.dits import causal_wanvideo
++from sglang.multimodal_gen.runtime.models.dits.causal_wanvideo import (
++    CausalWanT2VCrossAttention,
++)
++from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanT2VCrossAttention
++
++HEADS, DIM, CONTEXT, TOKENS = 2, 4, 5, 6
++CHANNELS = HEADS * DIM
++
++
++class _Linear(nn.Module):
++    def __init__(self, seed):
++        super().__init__()
++        generator = torch.Generator().manual_seed(seed)
++        self.weight = torch.randn(CHANNELS, CHANNELS, generator=generator)
++        self.calls = 0
++
++    def forward(self, x):
++        self.calls += 1
++        return x @ self.weight.T, None
++
++
++def _attention(q, k, v):
++    out = torch.nn.functional.scaled_dot_product_attention(
++        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
++    )
++    return out.transpose(1, 2)
++
++
++def _module():
++    """CausalWanT2VCrossAttention with CPU stand-ins for its projections and attention backend."""
++    module = CausalWanT2VCrossAttention.__new__(CausalWanT2VCrossAttention)
++    nn.Module.__init__(module)
++    module.to_q, module.to_k, module.to_v, module.to_out = (
++        _Linear(1),
++        _Linear(2),
++        _Linear(3),
++        _Linear(4),
++    )
++    module.norm_q = module.norm_k = nn.Identity()
++    module.tp_rmsnorm = False
++    module.local_num_heads, module.head_dim = HEADS, DIM
++    module.attn = _attention
++    return module
++
++
++def test_stock_causal_block_builds_a_cache_aware_cross_attention():
++    assert issubclass(CausalWanT2VCrossAttention, WanT2VCrossAttention)
++    assert "crossattn_cache" in inspect.signature(CausalWanT2VCrossAttention.forward).parameters
++    source = inspect.getsource(causal_wanvideo.CausalWanTransformerBlock.__init__)
++    assert "self.attn2 = CausalWanT2VCrossAttention(" in source
++    block_forward = inspect.getsource(causal_wanvideo.CausalWanTransformerBlock.forward)
++    assert "crossattn_cache=crossattn_cache" in block_forward
++
++
++def test_cached_cross_attention_equals_uncached_and_projects_context_once():
++    module = _module()
++    generator = torch.Generator().manual_seed(0)
++    x = torch.randn(1, TOKENS, CHANNELS, generator=generator)
++    context = torch.randn(1, CONTEXT, CHANNELS, generator=generator)
++    reference = WanT2VCrossAttention.forward(module, x, context, None)
++    assert (module.to_k.calls, module.to_v.calls) == (1, 1)
++    cache = CrossAttentionKVCache(
++        k=torch.zeros(1, CONTEXT, HEADS, DIM), v=torch.zeros(1, CONTEXT, HEADS, DIM)
++    )
++    first = module(x, context, crossattn_cache=cache)
++    assert cache.is_init and torch.equal(first, reference)
++    second = module(x * 2, context * 0, crossattn_cache=cache)  # reuses the stored text K/V
++    assert (module.to_k.calls, module.to_v.calls) == (2, 2)
++    expected = WanT2VCrossAttention.forward(module, x * 2, context, None)
++    assert torch.allclose(second, expected, atol=1e-6, rtol=1e-6)
++    cache.reset()
++    third = module(x, context * 0, crossattn_cache=cache)
++    assert (module.to_k.calls, module.to_v.calls) == (4, 4)
++    assert not torch.allclose(third, reference)
++    without = module(x, context)  # no cache: exactly WanT2VCrossAttention.forward
++    assert torch.equal(without, reference)
+-- 
+2.47.1
+

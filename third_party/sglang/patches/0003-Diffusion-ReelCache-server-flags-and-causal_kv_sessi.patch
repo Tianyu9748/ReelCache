@@ -1,0 +1,329 @@
+From 31dc9ac16245c2eed69d29b80da6efa38d7f30a2 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 16:13:37 -0400
+Subject: [PATCH 03/26] [Diffusion] ReelCache server flags and
+ causal_kv_session request handle
+
+- ServerArgs.reelcache_config (ReelCacheArgs): --reelcache-enable, --reelcache-config
+  (JSON object or file), --reelcache-hevc-inter-prediction (BooleanOptional,
+  default off). Enabled servers check at startup that
+  reelcache.integrations.sglang is importable and fail explicitly otherwise;
+  ReelCache cannot be combined with --kv-cache-quant and is single-GPU for now.
+- The GPU worker attaches the backend after building the pipeline
+  (attach_causal_kv_backend); disabled workers import nothing from ReelCache.
+- SamplingParams.causal_kv_session (+ --causal-kv-session): validated
+  plain-data handle {session_id, action generate|resume|fork|rewind,
+  pause_after_chunks, from_session, checkpoint, replace}; part of the batch
+  signature so requests of different sessions are never merged.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../multimodal_gen/configs/reelcache.py       | 115 ++++++++++++++++++
+ .../configs/sample/sampling_params.py         |  16 +++
+ .../runtime/managers/gpu_worker.py            |   8 ++
+ .../runtime/server_args/server_args.py        |  56 +++++++++
+ 4 files changed, 195 insertions(+)
+ create mode 100644 python/sglang/multimodal_gen/configs/reelcache.py
+
+diff --git a/python/sglang/multimodal_gen/configs/reelcache.py b/python/sglang/multimodal_gen/configs/reelcache.py
+new file mode 100644
+index 0000000000..65440ee1d2
+--- /dev/null
++++ b/python/sglang/multimodal_gen/configs/reelcache.py
+@@ -0,0 +1,115 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Server configuration of the optional ReelCache causal KV archive backend.
++
++Typed plain data carried by ``ServerArgs.reelcache_config``. It never imports
++ReelCache: the GPU worker loads the backend only when ``enabled`` is true (see
++``runtime/layers/kvcache/causal_kv_backend.py``), and an enabled server whose
++backend cannot be imported fails at startup instead of running the dense path.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++import os
++from dataclasses import dataclass, field
++from typing import Any
++
++REELCACHE_BACKEND_MODULE = "reelcache.integrations.sglang"
++
++
++class ReelCacheUnavailableError(RuntimeError):
++    """ReelCache was requested (``--reelcache-enable``) but its SGLang backend cannot be loaded."""
++
++
++def _load_config(value: Any) -> dict[str, Any]:
++    if value is None:
++        return {}
++    if isinstance(value, dict):
++        config = value
++    elif isinstance(value, str):
++        text = value.strip()
++        if text.startswith("{"):
++            config = json.loads(text)
++        elif os.path.isfile(text):
++            with open(text, encoding="utf-8") as handle:
++                config = json.load(handle)
++        else:
++            raise ValueError(
++                "--reelcache-config must be a JSON object or the path of a JSON file, "
++                f"got {value!r}"
++            )
++    else:
++        raise TypeError("reelcache config must be a JSON object, a JSON string or a path")
++    if not isinstance(config, dict):
++        raise ValueError("--reelcache-config must decode to a JSON object")
++    # Round-trip: the backend receives plain JSON data only (no live objects).
++    return json.loads(json.dumps(config))
++
++
++@dataclass
++class ReelCacheArgs:
++    """``--reelcache-enable``, ``--reelcache-config`` and ``--reelcache-hevc-inter-prediction``."""
++
++    enabled: bool = False
++    config: dict[str, Any] = field(default_factory=dict)
++    hevc_inter_prediction: bool = False
++
++    def validate(self) -> "ReelCacheArgs":
++        if type(self.enabled) is not bool:
++            raise TypeError("reelcache enabled must be a bool")
++        if type(self.hevc_inter_prediction) is not bool:
++            raise TypeError("reelcache hevc_inter_prediction must be a bool")
++        self.config = _load_config(self.config)
++        if "hevc_inter_prediction" in self.config and (
++            self.config["hevc_inter_prediction"] != self.hevc_inter_prediction
++        ):
++            raise ValueError(
++                "set HEVC inter prediction with --reelcache-hevc-inter-prediction, "
++                "not inside --reelcache-config"
++            )
++        if not self.enabled and (self.config or self.hevc_inter_prediction):
++            raise ValueError(
++                "--reelcache-config/--reelcache-hevc-inter-prediction require --reelcache-enable"
++            )
++        return self
++
++    def backend_config(self) -> dict[str, Any]:
++        """Plain JSON configuration handed to the backend factory."""
++        return {**self.config, "hevc_inter_prediction": self.hevc_inter_prediction}
++
++    def require_available(self) -> None:
++        """Fail clearly when ReelCache is requested but not importable (no dense fallback)."""
++        if not self.enabled:
++            return
++        try:
++            spec = importlib.util.find_spec(REELCACHE_BACKEND_MODULE)
++        except (ImportError, ValueError) as exc:
++            raise ReelCacheUnavailableError(
++                f"--reelcache-enable was requested but {REELCACHE_BACKEND_MODULE} cannot be "
++                f"imported: {exc}"
++            ) from exc
++        if spec is None:
++            raise ReelCacheUnavailableError(
++                f"--reelcache-enable was requested but {REELCACHE_BACKEND_MODULE} is not "
++                "installed; refusing to run the dense KV path instead"
++            )
++
++    def describe(self) -> str:
++        if not self.enabled:
++            return "off"
++        return (
++            f"on hevc_inter_prediction={self.hevc_inter_prediction} "
++            f"config_keys={sorted(self.config)}"
++        )
++
++    @classmethod
++    def from_dict(cls, kwargs: dict[str, Any]) -> "ReelCacheArgs":
++        """Build from flat CLI kwargs (dest names ``reelcache_*``)."""
++        return cls(
++            enabled=bool(kwargs.get("reelcache_enable") or False),
++            config=kwargs.get("reelcache_config_json"),
++            hevc_inter_prediction=bool(
++                kwargs.get("reelcache_hevc_inter_prediction") or False
++            ),
++        ).validate()
+diff --git a/python/sglang/multimodal_gen/configs/sample/sampling_params.py b/python/sglang/multimodal_gen/configs/sample/sampling_params.py
+index 01dc5a9c99..2e150c8992 100644
+--- a/python/sglang/multimodal_gen/configs/sample/sampling_params.py
++++ b/python/sglang/multimodal_gen/configs/sample/sampling_params.py
+@@ -332,6 +332,12 @@ class SamplingParams:
+     enable_spectrum: bool = False
+     spectrum_params: Any = None  # SpectrumParams
+ 
++    # Clean-boundary session handle for a causal KV archive backend (ReelCache,
++    # ``--reelcache-enable``): plain JSON, see ``validate_causal_kv_session``.
++    # None = ordinary generation. Part of the batch signature so requests of
++    # different sessions are never merged.
++    causal_kv_session: dict[str, Any] | None = None
++
+     # Profiling
+     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
+     num_profiled_timesteps: int = field(default=5, metadata={"batch_sig_exclude": True})
+@@ -587,6 +593,12 @@ class SamplingParams:
+             )
+ 
+         resolve_skip_softmax_params(self.skip_softmax_params)
++        if self.causal_kv_session is not None:
++            from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import (
++                validate_causal_kv_session,
++            )
++
++            self.causal_kv_session = validate_causal_kv_session(self.causal_kv_session)
+ 
+         # These are always required to be sane regardless of pipeline.
+         if (
+@@ -1049,6 +1061,10 @@ class SamplingParams:
+             "--cache-dit-params",
+             type=json.loads,
+         )
++        add_argument(
++            "--causal-kv-session",
++            type=json.loads,
++        )
+         add_argument(
+             "--cfg-gate-step",
+             type=float,
+diff --git a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+index 0ce719e3ab..3c4d588276 100644
+--- a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
++++ b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+@@ -71,6 +71,9 @@ from sglang.multimodal_gen.runtime.observability.metrics import (
+     DiffusionMetrics,
+     init_metrics,
+ )
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import (
++    attach_causal_kv_backend,
++)
+ from sglang.multimodal_gen.runtime.pipelines_core import (
+     ComposedPipelineBase,
+     LoRAPipeline,
+@@ -248,6 +251,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+         self.server_args = server_args
+         self.metrics = init_metrics(server_args, rank)
+         self.pipeline: ComposedPipelineBase = None
++        self.causal_kv_backend = None
+ 
+         self.init_device_and_model()
+         load_snapshot = None if current_platform.is_cpu() else capture_memory_snapshot()
+@@ -429,6 +433,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+             setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
+ 
+         self.pipeline = build_pipeline(self.server_args)
++        # None unless --reelcache-enable; an enabled backend that cannot load raises here.
++        self.causal_kv_backend = attach_causal_kv_backend(
++            self.pipeline, self.server_args
++        )
+ 
+         # apply layerwise offload after lora is applied while building LoRAPipeline
+         # otherwise empty offloaded weights could fail lora converting
+diff --git a/python/sglang/multimodal_gen/runtime/server_args/server_args.py b/python/sglang/multimodal_gen/runtime/server_args/server_args.py
+index 75b683f989..7f72b78a27 100644
+--- a/python/sglang/multimodal_gen/runtime/server_args/server_args.py
++++ b/python/sglang/multimodal_gen/runtime/server_args/server_args.py
+@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+     is_ltx23_native_variant,
+ )
+ from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
++from sglang.multimodal_gen.configs.reelcache import ReelCacheArgs
+ from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
+ from sglang.multimodal_gen.configs.utils import expand_path_fields
+ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+@@ -524,6 +525,10 @@ class ServerArgs(DisaggServerArgsMixin):
+         default_factory=QVGKVQuantArgs, repr=False
+     )
+ 
++    # Optional ReelCache causal KV archive backend. Off by default; the
++    # disabled path imports nothing from ReelCache.
++    reelcache_config: ReelCacheArgs = field(default_factory=ReelCacheArgs, repr=False)
++
+     # Master port for distributed inference
+     master_port: int = 30005
+ 
+@@ -685,8 +690,21 @@ class ServerArgs(DisaggServerArgsMixin):
+         self._validate_batching()
+         self._validate_breakable_cuda_graph()
+         self._validate_minimax_h3_adaln()
++        self._validate_reelcache()
+         self.pipeline_config.validate_server_args(self)
+ 
++    def _validate_reelcache(self) -> None:
++        if isinstance(self.reelcache_config, dict):
++            self.reelcache_config = ReelCacheArgs(**self.reelcache_config)
++        self.reelcache_config.validate()
++        if not self.reelcache_config.enabled:
++            return
++        self.reelcache_config.require_available()
++        if self.kv_cache_quant_config.enabled:
++            raise ValueError("--reelcache-enable cannot be combined with --kv-cache-quant")
++        if self.num_gpus != 1:
++            raise ValueError("--reelcache-enable currently supports a single GPU (num_gpus=1)")
++
+     def _validate_minimax_h3_adaln(self) -> None:
+         # Warn, not raise: config-file and from_kwargs construction mark every
+         # provided key as explicit, so a shared base config pinning the
+@@ -2779,6 +2797,31 @@ class ServerArgs(DisaggServerArgsMixin):
+             help="Leading sink chunks kept bf16 forever (default 0).",
+         )
+ 
++        # ReelCache causal KV archive backend
++        parser.add_argument(
++            "--reelcache-enable",
++            action="store_true",
++            default=None,
++            help="Archive clean causal KV chunks with ReelCache (archive_native mode) and "
++            "accept causal_kv_session requests (pause/resume/rewind/fork). Startup "
++            "fails if reelcache.integrations.sglang is unavailable.",
++        )
++        parser.add_argument(
++            "--reelcache-config",
++            dest="reelcache_config_json",
++            type=str,
++            default=None,
++            help="ReelCache runtime configuration: a JSON object or the path of a JSON "
++            "file (representation, energy profile, store root, budgets, ...).",
++        )
++        parser.add_argument(
++            "--reelcache-hevc-inter-prediction",
++            action=argparse.BooleanOptionalAction,
++            default=None,
++            help="Allow HEVC inter/motion prediction in ReelCache coefficient streams "
++            "(default: off, all-intra).",
++        )
++
+         # quantization
+         parser.add_argument(
+             "--quantization",
+@@ -3515,6 +3558,17 @@ class ServerArgs(DisaggServerArgsMixin):
+                         "kv_cache_quant_config must be QVGKVQuantArgs or a dict"
+                     )
+                 server_args_kwargs["kv_cache_quant_config"] = kv_quant_config
++            elif attr == "reelcache_config":
++                reelcache_config = kwargs.get("reelcache_config")
++                if reelcache_config is None:
++                    reelcache_config = ReelCacheArgs.from_dict(kwargs)
++                elif isinstance(reelcache_config, dict):
++                    reelcache_config = ReelCacheArgs(**reelcache_config).validate()
++                elif isinstance(reelcache_config, ReelCacheArgs):
++                    reelcache_config.validate()
++                else:
++                    raise TypeError("reelcache_config must be ReelCacheArgs or a dict")
++                server_args_kwargs["reelcache_config"] = reelcache_config
+             elif attr in kwargs:
+                 server_args_kwargs[attr] = kwargs[attr]
+ 
+@@ -3598,6 +3652,8 @@ class ServerArgs(DisaggServerArgsMixin):
+             "dp": "dp_size",
+             "layerwise_offload_modules": "layerwise_offload_components",
+             "mode": "performance_mode",
++            "reelcache_config": "reelcache_config_json",
++            "no_reelcache_hevc_inter_prediction": "reelcache_hevc_inter_prediction",
+         }
+         for alias_name, dest_name in cli_aliases.items():
+             if alias_name in provided_arg_names:
+-- 
+2.47.1
+

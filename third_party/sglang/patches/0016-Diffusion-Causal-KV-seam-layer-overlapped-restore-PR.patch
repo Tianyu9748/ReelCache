@@ -1,0 +1,463 @@
+From 66fd344c7ffa4e4feae87b9d5a7b1fef1727e6b5 Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:38:43 -0400
+Subject: [PATCH 16/26] [Diffusion] Causal KV seam: layer-overlapped restore
+ (PROTOTYPE, not for reelcache-integration)
+
+Prototype for measuring a layer-overlapped restore of archived session KV; not merged into
+the integration branch the ReelCache freezes pin.
+
+- CausalSelfAttentionKVCache.restore_pending (default None: unchanged): a backend that installs
+  restored history in the background leaves a per-layer readiness object there. The first K/V
+  access, at the top of update_and_get_attention_kv, waits on it once, before the eviction roll
+  can move restored tokens. can_direct_current_attention is False while a restore is pending.
+- Session handle key overlap_restore (off | first_forward | early) selects the mode per request.
+- Early restore: the GPU worker offers each causal stage's begin_causal_kv_early_restore at
+  dispatch, before text encoding and latent preparation, in inference mode. The stage hands its
+  existing caches and RoPE to the backend's early_restore. The worker calls the backend's
+  release_early_restore once the request returned or failed. Best effort: never fails a request.
+- Unit tests: test_causal_kv_overlap.py (wait before writes and the roll, one-shot, typed failure,
+  handle validation, the stage's early offer).
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_attention_cache.py  |  22 +++
+ .../layers/kvcache/causal_kv_backend.py       |  31 +++-
+ .../runtime/managers/gpu_worker.py            |  54 +++++-
+ .../pipelines_core/stages/causal_denoising.py |  38 ++++
+ .../test/unit/test_causal_kv_overlap.py       | 173 ++++++++++++++++++
+ 5 files changed, 306 insertions(+), 12 deletions(-)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+index f87e3cd67d..1e7ba17221 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_attention_cache.py
+@@ -3,6 +3,7 @@
+ import itertools
+ from collections.abc import Callable, Sequence
+ from dataclasses import dataclass, field
++from typing import Any
+ 
+ import torch
+ 
+@@ -129,6 +130,11 @@ class CausalSelfAttentionKVCache:
+     mutation_generation: int = field(
+         default_factory=_next_kv_mutation, compare=False, repr=False
+     )
++    # Layer-overlapped restore (opt-in; None = unchanged behavior): a backend
++    # that installs restored history in the background leaves its per-layer
++    # readiness here (``CausalKVLayerReadiness``). The first K/V access of the
++    # cache (``update_and_get_attention_kv``) waits on it once, then clears it.
++    restore_pending: Any = field(default=None, compare=False, repr=False)
+ 
+     def __post_init__(self) -> None:
+         if self.cache_size == 0:
+@@ -221,7 +227,22 @@ class CausalSelfAttentionKVCache:
+         if self.attention_window_size == old_cache_size:
+             self.attention_window_size = new_cache_size
+ 
++    def await_restored_history(self) -> None:
++        """Wait (once) for a background restore of this layer's history.
++
++        ``restore_pending.wait()`` blocks the host until the layer's restore
++        was issued and orders the current stream after its writes (no host
++        sync). It must run before any read or write of ``k``/``v``: a new
++        chunk's append may roll restored tokens inside the buffer.
++        """
++        pending = self.restore_pending
++        if pending is not None:
++            self.restore_pending = None
++            pending.wait()
++
+     def can_direct_current_attention(self, num_new_tokens: int) -> bool:
++        if self.restore_pending is not None:
++            return False
+         return (
+             self.sink_tokens == 0
+             and self.cache_size == num_new_tokens
+@@ -251,6 +272,7 @@ class CausalSelfAttentionKVCache:
+                 chunk. Negative values are invalid.
+ 
+         """
++        self.await_restored_history()
+         self.mutation_generation = _next_kv_mutation()
+         num_new_tokens = key.shape[1]
+         num_input_heads = key.shape[2]
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+index 74c8ad3144..07ea223e24 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+@@ -43,6 +43,19 @@ A backend that sets ``observes_plain_requests`` also receives requests without
+ a session handle (``CausalKVRequest.session`` is None) and may time their clean
+ forwards (``begin_clean_forward`` / ``end_clean_forward``) without capturing.
+ 
++Layer-overlapped restore (PROTOTYPE, branch ``reelcache-overlap-proto``, not
++merged): a backend may install restored history in the background. It then
++leaves a per-layer readiness object (:class:`CausalKVLayerReadiness`) in each
++cache's ``restore_pending``; the cache's first K/V access waits on it
++(``CausalSelfAttentionKVCache.await_restored_history``). A backend may also
++start such a restore when the worker dispatches a session request, before
++text encoding and latent preparation: the worker calls each causal stage's
++``begin_causal_kv_early_restore(req, server_args)`` (the stage hands its
++existing caches and RoPE to the backend's ``early_restore``) and, once the
++request returned or failed, the backend's ``release_early_restore``. The
++session handle's ``overlap_restore`` (``off`` | ``first_forward`` | ``early``)
++selects the mode per request; absent, the backend's default applies.
++
+ Everything crossing this seam is plain data or a live tensor owned by the
+ worker; nothing here is serialized into requests.
+ """
+@@ -68,7 +81,10 @@ _SESSION_KEYS = {
+     "durable",
+     "output",
+     "decode_context_latents",
++    "overlap_restore",
+ }
++# ``overlap_restore`` (PROTOTYPE): how a request that restores history installs it.
++OVERLAP_RESTORE_MODES = ("off", "first_forward", "early")
+ # ``output`` of a request that restored history: ``new`` decodes only its new
+ # chunks (after ``decode_context_latents`` preceding latent frames that warm
+ # the causal VAE decoder; their frames are dropped), ``full`` the whole clip.
+@@ -131,6 +147,9 @@ def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
+     context = value.get("decode_context_latents")
+     if context is not None and (type(context) is not int or context < 1):
+         raise ValueError("causal_kv_session.decode_context_latents must be a positive int")
++    overlap = value.get("overlap_restore")
++    if overlap is not None and overlap not in OVERLAP_RESTORE_MODES:
++        raise ValueError(f"causal_kv_session.overlap_restore must be one of {OVERLAP_RESTORE_MODES}")
+     result = {"session_id": session_id, "action": action, "replace": replace}
+     for name, item in (
+         ("pause_after_chunks", pause),
+@@ -139,6 +158,7 @@ def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
+         ("durable", durable),
+         ("output", output),
+         ("decode_context_latents", context),
++        ("overlap_restore", overlap),
+     ):
+         if item is not None:
+             result[name] = item
+@@ -226,6 +246,12 @@ class CausalKVRestoreTarget:
+     device: torch.device
+ 
+ 
++class CausalKVLayerReadiness(Protocol):
++    """One layer of a background restore (PROTOTYPE, ``restore_pending``)."""
++
++    def wait(self) -> None: ...  # until issued (raises the restore's failure), then the stream waits on it
++
++
+ class CausalKVRun(Protocol):
+     """Per-request state of an enabled backend (one request at a time per worker)."""
+ 
+@@ -259,8 +285,9 @@ class CausalKVBackend(Protocol):
+     Optional members (feature-detected): ``set_boundary_hook(hook)``,
+     ``control(op, args) -> dict``, ``inflight_control(op, args) -> dict | None``
+     (session controls; failures raise exceptions with ``code``, ``status`` and
+-    ``to_dict()``), ``observes_plain_requests`` (bool) and the run's
+-    ``begin_clean_forward(capture)``.
++    ``to_dict()``), ``observes_plain_requests`` (bool), the run's
++    ``begin_clean_forward(capture)`` and (PROTOTYPE) ``early_restore(...)`` /
++    ``release_early_restore(request_id)``.
+     """
+ 
+     def begin_request(self, request: CausalKVRequest) -> CausalKVRun | None: ...
+diff --git a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+index b71c21305a..22b3019da6 100644
+--- a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
++++ b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+@@ -585,19 +585,53 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+         req = batch[0]
+         if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
+             self._fit_auto_residency_probe(req)
++        early = False
+         if self.causal_kv_backend is not None:
+             # first-new-chunk accounting of session requests (worker clock)
+             req.extra["causal_kv_dispatched_at"] = time.perf_counter()
+-        return self._execute_forward_common(
+-            req,
+-            forward_fn=lambda: self.pipeline.forward(req, self.server_args),
+-            log_reqs=[req],
+-            return_req=return_req,
+-            save_output_paths=lambda output_batch: self._save_output_paths(
+-                req, output_batch
+-            ),
+-            error_context=f"request {req.request_id}",
+-        )
++            early = self._begin_causal_kv_early_restore(req)
++        try:
++            return self._execute_forward_common(
++                req,
++                forward_fn=lambda: self.pipeline.forward(req, self.server_args),
++                log_reqs=[req],
++                return_req=return_req,
++                save_output_paths=lambda output_batch: self._save_output_paths(
++                    req, output_batch
++                ),
++                error_context=f"request {req.request_id}",
++            )
++        finally:
++            if early:
++                self._release_causal_kv_early_restore(req)
++
++    def _begin_causal_kv_early_restore(self, req) -> bool:
++        """PROTOTYPE (``reelcache-overlap-proto``): let a causal stage start the session request's restore now,
++        before text encoding and latent preparation (``begin_causal_kv_early_restore``). True when offered."""
++        if req.is_warmup or getattr(req, "causal_kv_session", None) is None:
++            return False
++        if not callable(getattr(self.causal_kv_backend, "early_restore", None)):
++            return False
++        for stage in getattr(self.pipeline, "stages", ()):
++            begin = getattr(stage, "begin_causal_kv_early_restore", None)
++            if callable(begin):
++                try:
++                    with current_platform.inference_mode():  # the stage caches are inference tensors
++                        begin(req, self.server_args)
++                except Exception:  # noqa: BLE001 - the regular restore path runs instead
++                    logger.exception("causal KV early restore failed to start")
++                return True
++        return False
++
++    def _release_causal_kv_early_restore(self, req) -> None:
++        """The request returned or failed: the backend discards an early restore it never adopted."""
++        release = getattr(self.causal_kv_backend, "release_early_restore", None)
++        if callable(release):
++            try:
++                with current_platform.inference_mode():
++                    release(getattr(req, "request_id", None))
++            except Exception:  # noqa: BLE001 - records only
++                logger.exception("causal KV early restore release failed")
+ 
+     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
+         """Yield grouped results after each request finishes its terminal stage."""
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+index 61f22e2686..9f38ac8510 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+@@ -452,6 +452,44 @@ class CausalDMDDenoisingStage(DenoisingStage):
+             raise
+         return run, int(resume_blocks)
+ 
++    def begin_causal_kv_early_restore(self, batch: Req, server_args: ServerArgs) -> None:
++        """PROTOTYPE (branch ``reelcache-overlap-proto``): offer the backend this session request's restore when the
++        worker dispatches it, before text encoding and latent preparation.
++
++        The stage hands over its existing self-attention caches and its RoPE. The backend plans from the session's
++        archived geometry and starts a background restore into these caches. At ``begin_request`` it adopts the
++        restore only for the same request, head and cache objects; otherwise it discards it. Caches the request
++        reallocates are therefore never adopted. Best effort: never raises.
++        """
++        backend = self._causal_kv_backend
++        early = getattr(backend, "early_restore", None)
++        if early is None or getattr(batch, "is_warmup", False):
++            return
++        try:
++            session = validate_causal_kv_session(getattr(batch, "causal_kv_session", None))
++            if session is None or session.get("action") == "generate":
++                return
++            if getattr(batch, "image_latent", None) is not None or self._causal_sequence_shard_enabled(batch):
++                return
++            kv_cache = self.causal_kv_cache
++            if not kv_cache:
++                return
++            transformer = self.transformer
++            rope = getattr(transformer, "causal_rotary_cos_sin", None)
++            rotate_key = getattr(transformer, "causal_rotate_key", None)
++            if rope is None or rotate_key is None:
++                return
++            early(
++                request_id=getattr(batch, "request_id", None),
++                session=session,
++                caches={"cond": kv_cache},
++                rope=rope,
++                rotate_key=rotate_key,
++                device=kv_cache[0].k.device,
++            )
++        except Exception:  # noqa: BLE001 - the regular restore path runs instead
++            logger.exception("causal KV early restore was not started")
++
+     def _causal_kv_chunk(
+         self,
+         batch: Req,
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
+new file mode 100644
+index 0000000000..777b23a312
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_overlap.py
+@@ -0,0 +1,173 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Layer-overlapped restore seam (PROTOTYPE, branch ``reelcache-overlap-proto``): ``restore_pending``, the session
++handle's ``overlap_restore`` and the stage's early-restore offer."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
++    CausalSelfAttentionKVCache,
++)
++from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import (
++    OVERLAP_RESTORE_MODES,
++    validate_causal_kv_session,
++)
++from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
++    CausalDMDDenoisingStage,
++)
++
++TPF, CHUNK_FRAMES, CACHE_FRAMES = 2, 3, 12
++CHUNK = CHUNK_FRAMES * TPF
++
++
++def _cache(*, sink_frames=3, cache_frames=CACHE_FRAMES):
++    shape = [1, cache_frames * TPF, 2, 4]
++    return CausalSelfAttentionKVCache(
++        k=torch.zeros(shape),
++        v=torch.zeros(shape),
++        global_end_index=torch.zeros(1, dtype=torch.long),
++        local_end_index=torch.zeros(1, dtype=torch.long),
++        cache_size=cache_frames * TPF,
++        sink_tokens=sink_frames * TPF,
++    )
++
++
++class _Pending:
++    """A background restore that writes the layer's history only when the consumer waits for it."""
++
++    def __init__(self, cache, fill):
++        self.cache, self.fill, self.calls = cache, fill, 0
++
++    def wait(self):
++        self.calls += 1
++        self.fill(self.cache)
++
++
++def _restored(chunks):
++    """A cache with ``chunks`` installed (cursors only, as a background restore leaves it) and the full layout."""
++    cache = _cache()
++    layout = cache.replay_layout([(index * CHUNK, CHUNK, False) for index in range(chunks)])
++    cache.install_restored_history(layout, lambda span, k, v: None)
++    return cache, layout
++
++
++def _fill(layout):
++    def fill(cache):
++        for span in layout.live:
++            positions = torch.arange(span.global_start, span.global_start + span.length, dtype=torch.float32)
++            cache.k[0, span.local_start : span.local_end] = positions.view(-1, 1, 1) + 1.0
++            cache.v[0, span.local_start : span.local_end] = -(positions.view(-1, 1, 1) + 1.0)
++
++    return fill
++
++
++def test_the_first_access_waits_once_before_reading_or_writing():
++    cache, layout = _restored(2)
++    pending = cache.restore_pending = _Pending(cache, _fill(layout))
++    assert not cache.can_direct_current_attention(CHUNK)  # never bypass a pending restore
++    key = torch.full((1, CHUNK, 2, 4), 100.0)
++    view = cache.update_and_get_attention_kv(key=key, value=-key, current_chunk_start=2 * CHUNK)
++    assert pending.calls == 1 and cache.restore_pending is None
++    # the restored history (written by the wait) is visible together with the new chunk
++    assert torch.equal(view.k[0, : 2 * CHUNK, 0, 0], torch.arange(2 * CHUNK, dtype=torch.float32) + 1.0)
++    assert torch.equal(view.k[0, 2 * CHUNK :, 0, 0], torch.full((CHUNK,), 100.0))
++    cache.update_and_get_attention_kv(key=key, value=-key, current_chunk_start=2 * CHUNK)
++    assert pending.calls == 1  # one-shot
++
++
++def test_the_wait_precedes_the_eviction_roll():
++    """A full window rolls the restored tokens inside the buffer on the next append: they must be written first."""
++    chunks = CACHE_FRAMES // CHUNK_FRAMES  # the buffer is full
++    cache, layout = _restored(chunks)
++    cache.restore_pending = _Pending(cache, _fill(layout))
++    key = torch.zeros(1, CHUNK, 2, 4)
++    cache.update_and_get_attention_kv(key=key, value=key, current_chunk_start=chunks * CHUNK)
++    reference, ref_layout = _restored(chunks)
++    _fill(ref_layout)(reference)
++    reference.update_and_get_attention_kv(key=key, value=key, current_chunk_start=chunks * CHUNK)
++    assert torch.equal(cache.k, reference.k) and torch.equal(cache.v, reference.v)
++    sink = cache.sink_tokens
++    assert torch.equal(cache.k[0, sink : sink + CHUNK, 0, 0], torch.arange(sink + CHUNK, sink + 2 * CHUNK,
++                                                                         dtype=torch.float32) + 1.0)
++
++
++def test_a_failed_restore_raises_at_the_access_and_writes_nothing():
++    cache, _ = _restored(1)
++
++    class Failed:
++        def wait(self):
++            raise RuntimeError("integrity")
++
++    cache.restore_pending = Failed()
++    before = cache.k.clone()
++    with pytest.raises(RuntimeError, match="integrity"):
++        cache.update_and_get_attention_kv(key=torch.ones(1, CHUNK, 2, 4), value=torch.ones(1, CHUNK, 2, 4),
++                                          current_chunk_start=CHUNK)
++    assert torch.equal(cache.k, before) and cache.restore_pending is None
++
++
++def test_a_cache_without_a_pending_restore_is_unchanged():
++    cache = _cache()
++    assert cache.restore_pending is None
++    view = cache.update_and_get_attention_kv(key=torch.ones(1, CHUNK, 2, 4), value=torch.ones(1, CHUNK, 2, 4),
++                                             current_chunk_start=0)
++    assert view.visible_global_end == CHUNK
++    probe = cache._position_shadow()
++    assert probe.restore_pending is None
++
++
++def test_the_session_handle_selects_the_overlap_mode():
++    assert OVERLAP_RESTORE_MODES == ("off", "first_forward", "early")
++    for mode in OVERLAP_RESTORE_MODES:
++        handle = validate_causal_kv_session({"session_id": "s", "action": "resume", "overlap_restore": mode})
++        assert handle["overlap_restore"] == mode
++    assert "overlap_restore" not in validate_causal_kv_session({"session_id": "s", "action": "resume"})
++    with pytest.raises(ValueError, match="overlap_restore"):
++        validate_causal_kv_session({"session_id": "s", "action": "resume", "overlap_restore": "always"})
++
++
++class _Backend:
++    def __init__(self, fail=False):
++        self.calls, self.fail = [], fail
++
++    def early_restore(self, **kwargs):
++        if self.fail:
++            raise RuntimeError("planning failed")
++        self.calls.append(kwargs)
++
++
++def _stage(backend, caches):
++    stage = object.__new__(CausalDMDDenoisingStage)
++    stage._causal_kv_backend = backend
++    stage.causal_kv_cache = caches
++    stage.transformer = SimpleNamespace(causal_rotary_cos_sin=lambda *a, **k: None,
++                                        causal_rotate_key=lambda k, cos, sin: k)
++    stage._causal_sequence_shard_enabled = lambda batch: False
++    return stage
++
++
++def _batch(session, **extra):
++    return SimpleNamespace(request_id="r1", causal_kv_session=session, is_warmup=False, image_latent=None, **extra)
++
++
++def test_the_stage_offers_session_restores_early_with_its_caches():
++    caches = [_cache(), _cache()]
++    backend = _Backend()
++    stage = _stage(backend, caches)
++    stage.begin_causal_kv_early_restore(_batch({"session_id": "f", "action": "fork", "from_session": "L",
++                                                "checkpoint": 2, "overlap_restore": "early"}), None)
++    [call] = backend.calls
++    assert call["request_id"] == "r1" and call["session"]["overlap_restore"] == "early"
++    assert call["caches"]["cond"] is caches and call["device"] == caches[0].k.device
++    for session in (None, {"session_id": "g", "action": "generate"}):
++        stage.begin_causal_kv_early_restore(_batch(session), None)
++    stage.begin_causal_kv_early_restore(_batch({"session_id": "s", "action": "resume"}, ), None)
++    assert len(backend.calls) == 2  # generate and plain requests are never offered
++    _stage(backend, None).begin_causal_kv_early_restore(_batch({"session_id": "s", "action": "resume"}), None)
++    assert len(backend.calls) == 2  # no stage caches yet (first request)
++    _stage(_Backend(fail=True), caches).begin_causal_kv_early_restore(
++        _batch({"session_id": "s", "action": "resume"}), None)  # a failing backend never fails the request
++    _stage(SimpleNamespace(), caches).begin_causal_kv_early_restore(
++        _batch({"session_id": "s", "action": "resume"}), None)  # a backend without the seam: nothing
+-- 
+2.47.1
+

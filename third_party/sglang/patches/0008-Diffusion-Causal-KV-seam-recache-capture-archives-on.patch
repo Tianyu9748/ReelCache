@@ -1,0 +1,377 @@
+From 8313d0fe2a29a4f841ee272429fa3425423a97ed Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:30:44 -0400
+Subject: [PATCH 08/26] [Diffusion] Causal KV seam: recache capture archives
+ only the written frames
+
+A clean forward that re-materializes earlier frames in place (e.g. a LongLive
+1.0 prompt-switch KV recache) is a separate capture kind:
+
+* CausalKVRecache(window, written, epoch_id, cause, details): the window fed
+  through the forward and the global token ranges the cache actually stored
+  (a sink-protected recompute leaves the sink out).
+* CausalKVCapture.kind ("clean_commit" | "kv_recache"); causal_kv_capture_scope
+  accepts a chunk or a recache; CausalKVRun.end_recache(recache) commits.
+* CausalDMDDenoisingStage._causal_kv_recache(...) builds the descriptor from
+  frames; _causal_kv_recache_scope(run, recache) captures every CFG stream's
+  recache forward run inside it (through _update_causal_context_cache) and
+  calls end_recache once on success only. The backend archives exactly the
+  written ranges as a new cache epoch, never the sink.
+* Capture stays at the attention level (CausalWanSelfAttention.forward);
+  attach_causal_kv_backend numbers the attention modules of the fully built
+  DiT, so pipelines that re-class or replace transformer blocks after
+  construction still capture every layer.
+
+Tests: descriptor math and validation, capture kinds, every stream captured
+then one commit, no commit after a failed recache, no-op without a run,
+attach-time layer numbering.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../layers/kvcache/causal_kv_backend.py       |  56 +++++++-
+ .../pipelines_core/stages/causal_denoising.py |  65 ++++++++-
+ .../test/unit/test_causal_kv_recache_seam.py  | 125 ++++++++++++++++++
+ 3 files changed, 235 insertions(+), 11 deletions(-)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_causal_kv_recache_seam.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+index 0416adc580..869bd8b1be 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+@@ -10,7 +10,14 @@ created once per GPU worker by :func:`attach_causal_kv_backend` and receives:
+ * the normalized pre-RoPE ``key`` and the ``value`` of every causal
+   self-attention layer, in native dtype and ``[B, T, H, D]`` layout, during the
+   *clean* context forward of a chunk only (never denoising-step forwards, never
+-  post-RoPE keys);
++  post-RoPE keys), handed over inside ``CausalWanSelfAttention.forward`` (the
++  attention level, so DiTs that re-class their transformer blocks still
++  capture);
++* clean *recache* forwards (``kind="kv_recache"``, e.g. a LongLive 1.0
++  prompt-switch KV recache): the whole window is captured but only the token
++  ranges the cache actually rewrote (:class:`CausalKVRecache` ``written``,
++  never the protected sink) are archived, as a new cache epoch
++  (``end_recache``);
+ * chunk-boundary callbacks (``end_chunk``) that can request a pause at the
+   clean boundary;
+ * a restore target (:class:`CausalKVRestoreTarget`) through which restored
+@@ -25,7 +32,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import importlib
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
+ 
+ import torch
+@@ -108,12 +115,34 @@ class CausalKVChunk:
+     shot_index: int
+ 
+ 
++CAPTURE_KINDS = ("clean_commit", "kv_recache")
++
++
+ @dataclass(frozen=True, slots=True)
+ class CausalKVCapture:
+-    """The clean context forward being captured: one chunk of one CFG stream."""
++    """The clean forward being captured: one chunk (or recache window) of one CFG stream."""
+ 
+-    chunk: CausalKVChunk
++    chunk: CausalKVChunk  # for kind="kv_recache": the recache window
+     stream: str  # "cond" or "uncond"
++    kind: str = "clean_commit"  # one of CAPTURE_KINDS
++
++
++@dataclass(frozen=True, slots=True)
++class CausalKVRecache:
++    """A clean forward that re-materializes earlier frames in place (no new frames).
++
++    ``window`` is the span fed through the forward (positions and RoPE start of
++    its first frame; ``index`` is -1). ``written`` lists the global token ranges
++    ``(token_start, num_tokens)`` whose new K/V the cache stored; a
++    sink-protected recompute leaves the sink out. A backend archives exactly
++    ``written`` (whole archived chunks) as cache epoch ``epoch_id``.
++    """
++
++    window: CausalKVChunk
++    written: tuple[tuple[int, int], ...]
++    epoch_id: str
++    cause: str = "kv_recache"
++    details: Mapping[str, Any] = field(default_factory=dict)  # JSON data
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -169,6 +198,8 @@ class CausalKVRun(Protocol):
+ 
+     def end_chunk(self, chunk: CausalKVChunk, latents: torch.Tensor) -> bool: ...
+ 
++    def end_recache(self, recache: CausalKVRecache) -> Any: ...
++
+     def finish(self, *, error: BaseException | None) -> dict[str, Any]: ...
+ 
+ 
+@@ -215,13 +246,17 @@ def active_causal_kv_capture() -> _CaptureScope | None:
+ 
+ @contextlib.contextmanager
+ def causal_kv_capture_scope(
+-    run: CausalKVRun, chunk: CausalKVChunk, kv_cache: Any
++    run: CausalKVRun, target: CausalKVChunk | CausalKVRecache, kv_cache: Any
+ ) -> Iterator[_CaptureScope]:
+-    """Capture the clean context forward of ``chunk`` into ``kv_cache``'s stream."""
++    """Capture the clean forward of ``target`` (a chunk, or a recache window) into ``kv_cache``'s stream."""
+     global _ACTIVE_CAPTURE
+     if _ACTIVE_CAPTURE is not None:
+         raise RuntimeError("causal KV capture scopes cannot be nested")
+-    scope = _CaptureScope(run, CausalKVCapture(chunk, run.stream_of(kv_cache)))
++    if isinstance(target, CausalKVRecache):
++        capture = CausalKVCapture(target.window, run.stream_of(kv_cache), "kv_recache")
++    else:
++        capture = CausalKVCapture(target, run.stream_of(kv_cache))
++    scope = _CaptureScope(run, capture)
+     _ACTIVE_CAPTURE = scope
+     try:
+         yield scope
+@@ -273,6 +308,13 @@ def attach_causal_kv_backend(pipeline: Any, server_args: Any) -> CausalKVBackend
+             f"--reelcache-enable was requested but {REELCACHE_BACKEND_MODULE} could not be "
+             f"loaded: {exc!r}"
+         ) from exc
++    # Number the attention modules of the fully built DiT(s): pipelines may re-class
++    # or replace transformer blocks after construction; capture happens inside the
++    # self-attention modules (attention level), never in a block forward.
++    for stage in stages:
++        blocks = getattr(getattr(stage, "transformer", None), "blocks", None)
++        if blocks is not None:
++            assign_causal_attention_layer_indices(blocks)
+     backend = factory(
+         config=args.backend_config(),
+         pipeline=pipeline,
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+index 5779e1bd3a..3f906ef805 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import
+ )
+ from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import (
+     CausalKVChunk,
++    CausalKVRecache,
+     CausalKVRequest,
+     CausalKVRestoreTarget,
+     causal_kv_capture_scope,
+@@ -158,7 +159,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
+     # Optional causal KV archive backend (``--reelcache-enable``). None keeps the
+     # dense path unchanged; class defaults also cover stages built with __new__.
+     _causal_kv_backend: Any = None
+-    _causal_kv_pending: tuple[Any, CausalKVChunk] | None = None
++    _causal_kv_pending: tuple[Any, CausalKVChunk | CausalKVRecache] | None = None
+     _causal_kv_cache_frames_override: int | None = None
+ 
+     def default_workload_iterations(
+@@ -242,8 +243,64 @@ class CausalDMDDenoisingStage(DenoisingStage):
+         pending = self._causal_kv_pending
+         if pending is None:
+             return nullcontext()
+-        run, chunk = pending
+-        return causal_kv_capture_scope(run, chunk, kv_cache)
++        run, target = pending
++        return causal_kv_capture_scope(run, target, kv_cache)
++
++    @contextmanager
++    def _causal_kv_recache_scope(self, run, recache: CausalKVRecache):
++        """Capture the clean recache forward(s) run inside this block (every CFG stream).
++
++        For stages that re-materialize earlier frames (e.g. a LongLive 1.0
++        prompt-switch KV recache through ``_update_causal_context_cache``). On
++        success the backend archives only ``recache.written`` as a new cache
++        epoch; ``run=None`` (ordinary generation) captures nothing.
++        """
++        if run is None:
++            yield
++            return
++        previous = self._causal_kv_pending
++        self._causal_kv_pending = (run, recache)
++        try:
++            yield
++        finally:
++            self._causal_kv_pending = previous
++        run.end_recache(recache)
++
++    def _causal_kv_recache(
++        self,
++        batch: Req,
++        *,
++        window_start_frame: int,
++        window_frames: int,
++        written_frames: tuple[int, int],
++        pos_start_base: int,
++        epoch_id: str,
++        details: dict | None = None,
++    ) -> CausalKVRecache:
++        """Describe a recache forward over ``window_frames`` frames from ``window_start_frame``.
++
++        ``written_frames = (start, end)`` are the request frames whose new K/V the
++        cache stored (a sink-protected recompute skips the sink frames).
++        """
++        window = self._causal_kv_chunk(
++            batch,
++            block_index=-1,
++            start_frame=window_start_frame,
++            num_frames=window_frames,
++            pos_start_base=pos_start_base,
++            scene_cut=False,
++        )
++        start, end = written_frames
++        if not window_start_frame <= start < end <= window_start_frame + window_frames:
++            raise ValueError("recache written frames must lie inside the recache window")
++        tpf = self.num_token_per_frame
++        written = (((pos_start_base + start) * tpf, (end - start) * tpf),)
++        return CausalKVRecache(
++            window=window,
++            written=written,
++            epoch_id=epoch_id,
++            details=json.loads(json.dumps(details or {})),
++        )
+ 
+     def _causal_rope_start_frame(self, start_frame: int):
+         """Temporal RoPE start frame the transformer receives for ``start_frame``."""
+@@ -376,7 +433,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
+             num_tokens=tokens,
+             rope_start_frame=self._causal_rope_start_frame(start_frame),
+             scene_cut=scene_cut,
+-            shot_index=self._shot_index(batch, block_index),
++            shot_index=self._shot_index(batch, block_index) if block_index >= 0 else 0,
+         )
+ 
+     @contextmanager
+diff --git a/python/sglang/multimodal_gen/test/unit/test_causal_kv_recache_seam.py b/python/sglang/multimodal_gen/test/unit/test_causal_kv_recache_seam.py
+new file mode 100644
+index 0000000000..433070e9ab
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_causal_kv_recache_seam.py
+@@ -0,0 +1,125 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Recache capture seam: a clean recache forward is captured whole and archived only where it was written."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.multimodal_gen.runtime.layers.kvcache import causal_kv_backend as seam
++from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
++    CausalDMDDenoisingStage,
++)
++
++
++class _Run:
++    def __init__(self):
++        self.events = []
++
++    def stream_of(self, kv_cache):
++        return {"pos": "cond", "neg": "uncond"}[kv_cache]
++
++    def capture_layer(self, capture, layer_index, key, value, freqs_cis):
++        self.events.append(("layer", capture.kind, capture.stream, capture.chunk.index, layer_index))
++
++    def end_clean_forward(self, capture):
++        self.events.append(("end", capture.kind, capture.stream))
++
++    def end_recache(self, recache):
++        self.events.append(("recache", recache.epoch_id, recache.written))
++
++
++def _stage():
++    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
++    stage.num_token_per_frame = 4
++    return stage
++
++
++def _forward(stage, kv_cache, layers=2):
++    """What a clean forward does: the attention modules hand over their pre-RoPE K/V."""
++    with stage._causal_kv_capture_scope(kv_cache):
++        scope = seam.active_causal_kv_capture()
++        for layer in range(layers):
++            if scope is not None:
++                scope.capture_layer(layer, torch.zeros(1), torch.zeros(1), (None, None))
++
++
++def test_recache_descriptor_and_capture_kind():
++    stage = _stage()
++    batch = SimpleNamespace(extra={})
++    recache = stage._causal_kv_recache(
++        batch, window_start_frame=18, window_frames=12, written_frames=(21, 30), pos_start_base=0,
++        epoch_id="switch-c10", details={"prompt_segment": 1},
++    )
++    assert (recache.window.index, recache.window.start_frame, recache.window.num_frames) == (-1, 18, 12)
++    assert (recache.window.token_start, recache.window.num_tokens, recache.window.rope_start_frame) == (72, 48, 18)
++    assert recache.written == ((84, 36),) and recache.cause == "kv_recache"
++    assert recache.details == {"prompt_segment": 1}
++    with pytest.raises(ValueError):
++        stage._causal_kv_recache(batch, window_start_frame=18, window_frames=12, written_frames=(15, 30),
++                                 pos_start_base=0, epoch_id="bad")
++    run = _Run()
++    with seam.causal_kv_capture_scope(run, recache, "neg") as scope:
++        assert scope.capture.kind == "kv_recache" and scope.capture.chunk == recache.window
++    chunk = seam.CausalKVChunk(0, 0, 3, 0, 12, 0, False, 0)
++    with seam.causal_kv_capture_scope(run, chunk, "pos") as scope:
++        assert scope.capture.kind == "clean_commit"
++    assert run.events == [("end", "kv_recache", "uncond"), ("end", "clean_commit", "cond")]
++
++
++def test_recache_scope_captures_every_stream_then_commits_once():
++    stage, run = _stage(), _Run()
++    batch = SimpleNamespace(extra={})
++    recache = stage._causal_kv_recache(batch, window_start_frame=3, window_frames=9, written_frames=(6, 12),
++                                       pos_start_base=0, epoch_id="e1")
++    _forward(stage, "pos")  # nothing pending: no capture
++    assert run.events == []
++    with stage._causal_kv_recache_scope(run, recache):
++        _forward(stage, "pos")
++        _forward(stage, "neg")
++    assert stage._causal_kv_pending is None
++    assert run.events == [
++        ("layer", "kv_recache", "cond", -1, 0), ("layer", "kv_recache", "cond", -1, 1),
++        ("end", "kv_recache", "cond"),
++        ("layer", "kv_recache", "uncond", -1, 0), ("layer", "kv_recache", "uncond", -1, 1),
++        ("end", "kv_recache", "uncond"),
++        ("recache", "e1", ((24, 24),)),
++    ]
++    run.events.clear()
++    with pytest.raises(RuntimeError):
++        with stage._causal_kv_recache_scope(run, recache):
++            _forward(stage, "pos")
++            raise RuntimeError("recache forward failed")
++    assert ("recache", "e1", ((24, 24),)) not in run.events  # a failed recache is never committed
++    assert stage._causal_kv_pending is None
++    with stage._causal_kv_recache_scope(None, recache):  # ordinary generation: no backend run
++        _forward(stage, "pos")
++    assert stage._causal_kv_pending is None
++
++
++def test_attach_numbers_the_attention_modules_of_the_built_dit(monkeypatch):
++    """Capture lives in the self-attention modules; blocks re-classed or replaced after DiT construction
++    (e.g. precision policies of out-of-tree profiles) are numbered when the backend attaches."""
++    from sglang.multimodal_gen.configs.reelcache import ReelCacheArgs
++
++    blocks = [SimpleNamespace(attn1=SimpleNamespace(layer_index=None)) for _ in range(3)]
++    attached = []
++
++    class Stage:
++        transformer = SimpleNamespace(blocks=blocks)
++
++        def set_causal_kv_backend(self, backend):
++            attached.append(backend)
++
++    created = []
++
++    def create_sglang_backend(*, config, pipeline, server_args):
++        created.append(([block.attn1.layer_index for block in blocks], config))
++        return "backend"
++
++    monkeypatch.setattr(seam.importlib, "import_module",
++                        lambda name: SimpleNamespace(create_sglang_backend=create_sglang_backend))
++    args = ReelCacheArgs(enabled=True, config={"store_root": "/unused"}).validate()
++    backend = seam.attach_causal_kv_backend(SimpleNamespace(stages=[Stage()]), SimpleNamespace(reelcache_config=args))
++    assert backend == "backend" and attached == ["backend"]
++    assert created == [([0, 1, 2], {"store_root": "/unused", "hevc_inter_prediction": False})]
+-- 
+2.47.1
+

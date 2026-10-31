@@ -1,0 +1,251 @@
+From 909644fce21b565e421a80083cca928250a972cd Mon Sep 17 00:00:00 2001
+From: Tianyu9748 <54686548+Tianyu9748@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 02:02:45 -0400
+Subject: [PATCH 25/26] [Diffusion] Causal KV requests: workload metadata
+
+CausalKVRequest gains two optional fields, generation_index (int) and
+workload (plain-JSON dict), both None by default. The causal denoising
+stage fills them from req.extra["workload"] (CAUSAL_KV_WORKLOAD_KEY;
+validated by causal_kv_workload_metadata: a JSON object, copied, with an
+optional non-negative int generation_index) when it hands a request to an
+attached backend. They are request metadata for unhashed sidecars and
+request records (the workload runner's generation index and its own
+record), never part of the conditioning identity or any hash and not a
+session (routing) field; CausalKVRequest.request_id stays the SGLang
+request id. Without the key the request is exactly as before; without a
+backend it is never read. New unit test
+test/unit/test_wl_request_metadata.py.
+---
+ .../layers/kvcache/causal_kv_backend.py       |  32 +++++
+ .../pipelines_core/stages/causal_denoising.py |   7 ++
+ .../test/unit/test_wl_request_metadata.py     | 117 ++++++++++++++++++
+ 3 files changed, 156 insertions(+)
+ create mode 100644 python/sglang/multimodal_gen/test/unit/test_wl_request_metadata.py
+
+diff --git a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+index 1a391048b1..88d023424a 100644
+--- a/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
++++ b/python/sglang/multimodal_gen/runtime/layers/kvcache/causal_kv_backend.py
+@@ -59,6 +59,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import importlib
++import json
+ from dataclasses import dataclass, field
+ from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
+ 
+@@ -82,6 +83,10 @@ _SESSION_KEYS = {
+ # chunks (after ``decode_context_latents`` preceding latent frames that warm
+ # the causal VAE decoder; their frames are dropped), ``full`` the whole clip.
+ SESSION_OUTPUTS = ("new", "full")
++# ``req.extra`` key of the optional workload metadata handed to the backend as
++# ``CausalKVRequest.generation_index`` / ``.workload`` (validated by
++# :func:`causal_kv_workload_metadata`); not a session (routing) field.
++CAUSAL_KV_WORKLOAD_KEY = "workload"
+ 
+ 
+ def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
+@@ -160,6 +165,27 @@ def validate_causal_kv_session(value: Any) -> dict[str, Any] | None:
+     return result
+ 
+ 
++def causal_kv_workload_metadata(value: Any) -> tuple[int | None, dict[str, Any] | None]:
++    """Validate the optional workload metadata of a request (``req.extra["workload"]``).
++
++    ``None`` means none: ``(None, None)``. Otherwise a JSON object, returned as a
++    plain-JSON copy together with its ``generation_index`` (a non-negative int,
++    or None when absent). Live objects are rejected.
++    """
++    if value is None:
++        return None, None
++    if not isinstance(value, Mapping):
++        raise ValueError("req.extra['workload'] must be a JSON object or None")
++    try:
++        workload = json.loads(json.dumps(dict(value), allow_nan=False))
++    except (TypeError, ValueError) as exc:
++        raise ValueError(f"req.extra['workload'] must be plain JSON: {exc}") from exc
++    index = workload.get("generation_index")
++    if index is not None and (type(index) is not int or index < 0):
++        raise ValueError("req.extra['workload']['generation_index'] must be a non-negative int")
++    return index, workload
++
++
+ @dataclass(frozen=True, slots=True)
+ class CausalKVChunk:
+     """One causal block of a request, in the stage's own coordinates."""
+@@ -227,6 +253,12 @@ class CausalKVRequest:
+     block_conditioning: tuple[str, ...] | None = None
+     # ``time.perf_counter()`` of the worker when it dispatched the request (first-new-chunk accounting).
+     dispatched_at: float | None = None
++    # Optional workload metadata (``req.extra["workload"]``, plain JSON; see :data:`CAUSAL_KV_WORKLOAD_KEY`): the
++    # runner's generation index of the node this request creates and its own record (e.g. k, planned ids, session
++    # tree id). Never part of any identity or hash: a backend may record it in unhashed sidecars and request
++    # records. None when absent (the request is handled exactly as without it).
++    generation_index: int | None = None
++    workload: dict[str, Any] | None = None
+ 
+ 
+ @dataclass(slots=True)
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+index f848ac24cc..8b8d9f3e53 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/causal_denoising.py
+@@ -16,11 +16,13 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import
+     CrossAttentionKVCache,
+ )
+ from sglang.multimodal_gen.runtime.layers.kvcache.causal_kv_backend import (
++    CAUSAL_KV_WORKLOAD_KEY,
+     CausalKVChunk,
+     CausalKVRecache,
+     CausalKVRequest,
+     CausalKVRestoreTarget,
+     causal_kv_capture_scope,
++    causal_kv_workload_metadata,
+     validate_causal_kv_session,
+ )
+ from sglang.multimodal_gen.runtime.layers.kvcache.qvg_packed_cache import (
+@@ -417,6 +419,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
+         patch = transformer.config.patch_size
+         grid = (ctx.height // patch[-2], ctx.width // patch[-1])
+         streams = ("cond", "uncond") if use_cfg else ("cond",)
++        generation_index, workload = causal_kv_workload_metadata(
++            (getattr(batch, "extra", None) or {}).get(CAUSAL_KV_WORKLOAD_KEY)
++        )
+         request = CausalKVRequest(
+             request_id=getattr(batch, "request_id", None),
+             session=session,
+@@ -446,6 +451,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
+             dispatched_at=(getattr(batch, "extra", None) or {}).get(
+                 "causal_kv_dispatched_at"
+             ),
++            generation_index=generation_index,
++            workload=workload,
+         )
+         run = backend.begin_request(request)
+         if run is None:
+diff --git a/python/sglang/multimodal_gen/test/unit/test_wl_request_metadata.py b/python/sglang/multimodal_gen/test/unit/test_wl_request_metadata.py
+new file mode 100644
+index 0000000000..fce5feae82
+--- /dev/null
++++ b/python/sglang/multimodal_gen/test/unit/test_wl_request_metadata.py
+@@ -0,0 +1,117 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Optional workload metadata of causal KV session requests (workload-v2).
++
++``req.extra["workload"]`` (plain JSON) reaches the backend as ``CausalKVRequest.generation_index`` / ``.workload``;
++it is never part of the request's conditioning identity, and without it the request is exactly as before.
++"""
++
++import dataclasses
++import math
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.multimodal_gen.runtime.layers.kvcache import causal_kv_backend as seam
++from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
++    CausalDMDDenoisingStage,
++)
++
++
++def test_metadata_validation():
++    assert seam.causal_kv_workload_metadata(None) == (None, None)
++    source = {"generation_index": 7, "request_id": "r-0007", "k": 2, "planned": {"source": "n3"}}
++    index, workload = seam.causal_kv_workload_metadata(source)
++    assert index == 7 and workload == source
++    source["planned"]["source"] = "changed"
++    assert workload["planned"]["source"] == "n3"  # a plain copy, not the caller's object
++    assert seam.causal_kv_workload_metadata({"k": 0}) == (None, {"k": 0})
++    for bad in ([1], "w", {"live": object()}, {"x": math.nan}, {"generation_index": -1},
++                {"generation_index": "3"}, {"generation_index": True}, {"generation_index": 1.0}):
++        with pytest.raises(ValueError):
++            seam.causal_kv_workload_metadata(bad)
++
++
++def test_request_fields_default_to_none():
++    names = [f.name for f in dataclasses.fields(seam.CausalKVRequest)]
++    assert names[-2:] == ["generation_index", "workload"]
++    request = seam.CausalKVRequest("r", None, {}, (3,), 4, (2, 2), 0, ("cond",), 1, 2, 4, "bfloat16", {})
++    assert request.generation_index is None and request.workload is None and request.dispatched_at is None
++
++
++class _Backend:
++    def __init__(self):
++        self.requests = []
++
++    def begin_request(self, request):
++        self.requests.append(request)
++        return None  # no run: nothing to restore
++
++
++def _stage(backend):
++    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
++    stage._causal_kv_backend = backend
++    stage.transformer = SimpleNamespace(
++        causal_rotary_cos_sin=lambda *a, **k: (None, None),
++        causal_rotate_key=lambda *a, **k: None,
++        config=SimpleNamespace(patch_size=(1, 2, 2)),
++    )
++    stage.num_token_per_frame = 4
++    stage.num_transformer_blocks = 1
++    stage.num_frames_per_block = 3
++    return stage
++
++
++def _begin(stage, extra):
++    batch = SimpleNamespace(
++        causal_kv_session={"session_id": "s", "action": "generate"},
++        is_warmup=False,
++        extra=extra,
++        image_latent=None,
++        request_id="r-0007",
++        sampling_params=None,
++    )
++    cache = SimpleNamespace(
++        k=torch.zeros(1, 24, 2, 4, dtype=torch.bfloat16),
++        cache_size=24,
++        sink_tokens=0,
++        global_sink_tokens=0,
++        attention_window_size=24,
++    )
++    return stage._begin_causal_kv_run(
++        batch,
++        SimpleNamespace(model_path="/models/m"),
++        ctx=SimpleNamespace(height=4, width=4),
++        block_sizes=[3, 3],
++        pos_start_base=0,
++        use_cfg=False,
++        kv_cache=[cache],
++        kv_cache_neg=None,
++        latents=torch.zeros(1, 4, 6, 4, 4),
++    )
++
++
++def test_metadata_reaches_the_backend_outside_the_identity():
++    backend = _Backend()
++    stage = _stage(backend)
++    assert _begin(stage, {}) == (None, 0)
++    metadata = {"generation_index": 12, "request_id": "r-0007", "k": 3, "session_tree": "t1"}
++    assert _begin(stage, {"workload": metadata}) == (None, 0)
++    plain, tagged = backend.requests
++    assert plain.generation_index is None and plain.workload is None
++    assert tagged.generation_index == 12 and tagged.workload == metadata and tagged.workload is not metadata
++    # everything else, the conditioning identity included, is unchanged by the metadata
++    assert dataclasses.replace(tagged, generation_index=None, workload=None) == plain
++    with pytest.raises(ValueError):
++        _begin(stage, {"workload": {"generation_index": -2}})
++    assert len(backend.requests) == 2  # an invalid request never reaches the backend
++
++
++def test_metadata_is_ignored_without_a_backend():
++    stage = _stage(None)
++    batch_extra = {"workload": {"generation_index": "not checked"}}
++    plain = SimpleNamespace(causal_kv_session=None, is_warmup=False, extra=batch_extra)
++    assert stage._begin_causal_kv_run(
++        plain, None, ctx=None, block_sizes=[3], pos_start_base=0, use_cfg=False,
++        kv_cache=None, kv_cache_neg=None, latents=torch.zeros(1),
++    ) == (None, 0)
+-- 
+2.47.1
+

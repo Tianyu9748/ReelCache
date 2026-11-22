@@ -118,3 +118,16 @@ The [docs/](docs/README.md) folder holds the details: [design](docs/design.md),
 [provenance](docs/provenance.md).
 
 This repository contains code only: no experiment harnesses, evaluation results or model weights.
+
+## Citation
+
+If you use ReelCache, please cite:
+
+```bibtex
+@article{wang2026reelcache,
+  title={ReelCache: An Efficient KV Cache Compression and Management System for Multi-Round Video Generation},
+  author={Wang, Tianyu and Yu, Daiyang and Ren, Zhiwei and Li, Junbo and Zhang, Jitian and Shangguan, Longfei},
+  journal={arXiv preprint arXiv:2611.09973},
+  year={2026}
+}
+```
